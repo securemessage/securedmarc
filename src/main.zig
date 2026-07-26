@@ -15,6 +15,7 @@ const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
+const zmq = securemilter.zmq;
 
 pub const dmarc = @import("dmarc.zig");
 pub const alignment = @import("alignment.zig");
@@ -29,11 +30,25 @@ pub const DmarcConfig = struct {
     dns_nameserver: []const u8,
     dns_timeout_ms: u32,
     dns_retries: u8,
+    zmq_endpoint: ?[]const u8,
+    zmq_topic: []const u8,
 };
 
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
+var g_zmq_endpoint: ?[]const u8 = null;
+var g_zmq_topic: []const u8 = "dmarc.evaluation";
+
+// Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
+threadlocal var tl_publisher: ?zmq.Publisher = null;
+
+fn getPublisher() *zmq.Publisher {
+    if (tl_publisher == null) {
+        tl_publisher = zmq.Publisher.init(g_zmq_endpoint, g_zmq_topic);
+    }
+    return &tl_publisher.?;
+}
 
 /// Parse the SecureDMARC config from a loaded Config.
 pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !DmarcConfig {
@@ -64,6 +79,10 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     const dns_timeout = global.getInt("DnsTimeout", u32, 5) * 1000;
     const dns_retries = global.getInt("DnsRetries", u8, 2);
 
+    // ZMQ event publishing
+    const zmq_endpoint = global.get("ZmqEndpoint");
+    const zmq_topic = global.getOrDefault("ZmqTopic", "dmarc.evaluation");
+
     return .{
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
@@ -73,6 +92,8 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .dns_nameserver = dns_ns,
         .dns_timeout_ms = dns_timeout,
         .dns_retries = dns_retries,
+        .zmq_endpoint = zmq_endpoint,
+        .zmq_topic = zmq_topic,
     };
 }
 
@@ -103,6 +124,8 @@ pub fn main() !void {
         .timeout_ms = dmarc_cfg.dns_timeout_ms,
         .retries = dmarc_cfg.dns_retries,
     };
+    g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
+    g_zmq_topic = dmarc_cfg.zmq_topic;
 
     // Daemonize
     if (!dmarc_cfg.foreground) {
@@ -284,6 +307,19 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     // Step 6: Add Authentication-Results header
     const disposition = dmarc.getDisposition(&rec, is_subdomain);
     addArHeaderFull(conn, result.toString(), from_domain, disposition);
+
+    // Publish ZMQ event with full evaluation details
+    publishEvent(
+        conn.allocator,
+        from_domain,
+        result.toString(),
+        disposition,
+        spf_result orelse "none",
+        dkim_result orelse "none",
+        dkim_domain orelse "",
+        envelope_domain orelse "",
+    );
+
     return @intFromEnum(responses.Code.@"continue");
 }
 
@@ -335,6 +371,24 @@ fn extractDkimDomain(conn: *connection_mod.Connection) ?[]const u8 {
 fn isSubdomainOfOrg(domain: []const u8) bool {
     const org = alignment.getOrganizationalDomain(domain);
     return !eqlIgnoreCase(domain, org);
+}
+
+fn publishEvent(
+    allocator: Allocator,
+    from_domain: []const u8,
+    result_str: []const u8,
+    disposition: []const u8,
+    spf_result_str: []const u8,
+    dkim_result_str: []const u8,
+    dkim_domain_str: []const u8,
+    envelope_from: []const u8,
+) void {
+    const json = std.fmt.allocPrint(allocator,
+        \\{{"from_domain":"{s}","result":"{s}","disposition":"{s}","spf_result":"{s}","dkim_result":"{s}","dkim_domain":"{s}","envelope_from":"{s}"}}
+    , .{ from_domain, result_str, disposition, spf_result_str, dkim_result_str, dkim_domain_str, envelope_from }) catch return;
+    defer allocator.free(json);
+
+    getPublisher().publish(json);
 }
 
 fn addArHeaderSimple(conn: *connection_mod.Connection, result_str: []const u8, reason: []const u8) void {
