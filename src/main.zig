@@ -35,11 +35,14 @@ pub const DmarcConfig = struct {
     zmq_topic: []const u8,
 };
 
+const reload_mod = securemilter.reload;
+
 // Module-level config set before worker spawn, read-only during runtime.
 var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dmarc.evaluation";
+var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
@@ -166,6 +169,7 @@ pub fn main() !void {
         .on_eoh = onEoh,
         .on_body = onBody,
         .on_eom = onEom,
+        .on_reload = onWorkerReload,
         .required_actions = required_actions,
     };
 
@@ -174,16 +178,17 @@ pub fn main() !void {
 
     daemon_mod.ManagedSignals.blockForKqueue();
 
-    var threads = try worker_mod.spawnPool(
+    var threads = try worker_mod.spawnPoolWithReload(
         allocator,
         dmarc_cfg.worker_threads,
         dmarc_cfg.listen_addresses,
         callbacks,
         shutdown_pipe[0],
+        &g_config_gen,
     );
     defer threads.deinit(allocator);
 
-    daemon_mod.ManagedSignals.waitForShutdown(shutdown_pipe[1]);
+    daemon_mod.ManagedSignals.signalLoop(shutdown_pipe[1], reloadConfig);
     for (threads.items) |t| t.join();
 }
 
@@ -478,6 +483,22 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 fn toLower(c: u8) u8 {
     if (c >= 'A' and c <= 'Z') return c + 32;
     return c;
+}
+
+// =============================================================================
+// Reload
+// =============================================================================
+
+/// Main-thread reload callback. SecureDMARC has no file-based reloadable
+/// state (it reads DMARC records from DNS per-message). This is a no-op
+/// that still increments the generation for interface consistency.
+fn reloadConfig() void {
+    g_config_gen.increment();
+    std.log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});
+}
+
+fn onWorkerReload() void {
+    std.log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
