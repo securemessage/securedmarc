@@ -1,0 +1,16 @@
+[global]
+AuthservID      = mail.example.com
+WorkerThreads   = 0
+Foreground      = no
+PidFile         = /var/run/securedmarc/securedmarc.pid
+User            = _dmarc
+Syslog          = yes
+SyslogFacility  = mail
+DnsNameserver   = 127.0.0.1
+DnsTimeout      = 5
+DnsRetries      = 2
+ZmqEndpoint     = tcp://events.internal:5555
+ZmqTopic        = dmarc
+
+[listener:inbound]
+Socket          = inet:8894@0.0.0.0

@@ -1,0 +1,19 @@
+.{
+    .name = .securedmarc,
+    .version = "0.1.0",
+    .fingerprint = 0xbc404386668d8646,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "config",
+        "LICENSE",
+        "README.md",
+    },
+    .dependencies = .{
+        .securemilter = .{
+            .path = "../securemilter-lib",
+        },
+    },
+}
