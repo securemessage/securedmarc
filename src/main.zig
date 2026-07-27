@@ -16,6 +16,7 @@ const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
 const zmq = securemilter.zmq;
+const log = securemilter.log;
 
 pub const dmarc = @import("dmarc.zig");
 pub const alignment = @import("alignment.zig");
@@ -118,7 +119,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
 }
 
 fn usageError() error{InvalidArgument} {
-    std.log.err("usage: securedmarc -c <config-file>", .{});
+    log.err("usage: securedmarc -c <config-file>", .{});
     return error.InvalidArgument;
 }
 
@@ -135,15 +136,20 @@ pub fn main() !void {
     const config_path = args.next() orelse return usageError();
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
-        std.log.err("failed to load config {s}: {}", .{ config_path, err });
+        log.err("failed to load config {s}: {}", .{ config_path, err });
         return err;
     };
     defer cfg.deinit();
 
     const dmarc_cfg = parseDmarcConfig(allocator, &cfg) catch |err| {
-        std.log.err("config parse error: {}", .{err});
+        log.err("config parse error: {}", .{err});
         return err;
     };
+
+    // Initialize logging from config
+    const log_cfg = if (cfg.global()) |g| log.LogConfig.fromSection(g, "securedmarc") else log.LogConfig.init(true, .mail, .info, "securedmarc");
+    log.initGlobal(&log_cfg);
+    log.initThread();
 
     // Set module-level globals
     g_authserv_id = dmarc_cfg.authserv_id;
@@ -161,23 +167,24 @@ pub fn main() !void {
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dmarc_cfg.foreground) {
         daemon_mod.daemonize() catch |err| {
-            std.log.err("daemonize failed: {}", .{err});
+            log.err("daemonize failed: {}", .{err});
             return err;
         };
+        log.initThread(); // re-init after fork (PID changed)
     }
 
     // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, dmarc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
-            std.log.warn("DNS health monitor thread failed: {}", .{err});
+            log.warn("DNS health monitor thread failed: {}", .{err});
         };
         g_health_monitor = monitor;
     } else |err| {
-        std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
+        log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
     }
 
     daemon_mod.writePidFile(dmarc_cfg.pid_file) catch |err| {
-        std.log.err("pid file write failed: {}", .{err});
+        log.err("pid file write failed: {}", .{err});
     };
     defer daemon_mod.removePidFile(dmarc_cfg.pid_file);
 
@@ -189,12 +196,12 @@ pub fn main() !void {
     // Drop privileges after PID file is written, before workers spawn
     if (dmarc_cfg.user) |user| {
         daemon_mod.dropPrivileges(user) catch |err| {
-            std.log.err("privilege drop to '{s}' failed: {}", .{ user, err });
+            log.err("privilege drop to '{s}' failed: {}", .{ user, err });
             return err;
         };
     }
 
-    std.log.info("SecureDMARC starting, AuthservID={s}, listeners={d}", .{
+    log.info("SecureDMARC starting, AuthservID={s}, listeners={d}", .{
         dmarc_cfg.authserv_id,
         dmarc_cfg.listen_addresses.len,
     });
@@ -536,11 +543,11 @@ fn toLower(c: u8) u8 {
 /// that still increments the generation for interface consistency.
 fn reloadConfig() void {
     g_config_gen.increment();
-    std.log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});
+    log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});
 }
 
 fn onWorkerReload() void {
-    std.log.debug("worker: config reload acknowledged", .{});
+    log.debug("worker: config reload acknowledged", .{});
 }
 
 // =============================================================================
