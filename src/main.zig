@@ -279,7 +279,14 @@ fn onBody(conn: *connection_mod.Connection, _: []const u8) u8 {
 }
 
 fn onEom(conn: *connection_mod.Connection) u8 {
-    return doDmarcEvaluation(conn);
+    const start_ns = std.time.nanoTimestamp();
+    const result = doDmarcEvaluation(conn);
+    const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
+    const queue_id = conn.macros.queue_id orelse "-";
+    const client_addr = conn.macros.client_addr orelse "unknown";
+    const from_domain = getFromDomain(conn) orelse "unknown";
+    log.info("id={s} client={s} domain={s} elapsed={d}ms", .{ queue_id, client_addr, from_domain, elapsed_ms });
+    return result;
 }
 
 /// Perform DMARC evaluation at end-of-message.
