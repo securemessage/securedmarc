@@ -147,7 +147,18 @@ pub fn main() !void {
         .retries = dmarc_cfg.dns_retries,
     };
 
-    // Start proactive DNS health monitor
+    g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
+    g_zmq_topic = dmarc_cfg.zmq_topic;
+
+    // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
+    if (!dmarc_cfg.foreground) {
+        daemon_mod.daemonize() catch |err| {
+            std.log.err("daemonize failed: {}", .{err});
+            return err;
+        };
+    }
+
+    // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, dmarc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
             std.log.warn("DNS health monitor thread failed: {}", .{err});
@@ -155,16 +166,6 @@ pub fn main() !void {
         g_health_monitor = monitor;
     } else |err| {
         std.log.warn("DNS health monitor init failed: {}, falling back to reactive", .{err});
-    }
-    g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
-    g_zmq_topic = dmarc_cfg.zmq_topic;
-
-    // Daemonize
-    if (!dmarc_cfg.foreground) {
-        daemon_mod.daemonize() catch |err| {
-            std.log.err("daemonize failed: {}", .{err});
-            return err;
-        };
     }
 
     daemon_mod.writePidFile(dmarc_cfg.pid_file) catch |err| {
