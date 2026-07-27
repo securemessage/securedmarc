@@ -108,9 +108,23 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Parse command-line: securedmarc -c /path/to/config
     var args = std.process.args();
     _ = args.next();
-    const config_path = args.next() orelse "/usr/local/etc/securedmarc/securedmarc.conf";
+    const config_path = blk: {
+        const flag = args.next() orelse {
+            std.log.err("usage: securedmarc -c <config-file>", .{});
+            return error.InvalidArgument;
+        };
+        if (!std.mem.eql(u8, flag, "-c")) {
+            std.log.err("usage: securedmarc -c <config-file>", .{});
+            return error.InvalidArgument;
+        }
+        break :blk args.next() orelse {
+            std.log.err("usage: securedmarc -c <config-file>", .{});
+            return error.InvalidArgument;
+        };
+    };
 
     var cfg = config_mod.parseFile(allocator, config_path) catch |err| {
         std.log.err("failed to load config {s}: {}", .{ config_path, err });
