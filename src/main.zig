@@ -285,7 +285,8 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const queue_id = conn.macros.queue_id orelse "-";
     const client_addr = conn.macros.client_addr orelse "unknown";
     const from_domain = getFromDomain(conn) orelse "unknown";
-    log.info("id={s} client={s} domain={s} elapsed={d}ms", .{ queue_id, client_addr, from_domain, elapsed_ms });
+    const peer = conn.getPeerDisplay();
+    log.info("id={s} peer={s}[{s}] client={s} domain={s} elapsed={d}ms", .{ queue_id, peer.name, peer.ip, client_addr, from_domain, elapsed_ms });
     return result;
 }
 
