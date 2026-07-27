@@ -1,0 +1,150 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDMARC 8
+.Os
+.Sh NAME
+.Nm securedmarc
+.Nd DMARC policy evaluation milter for Postfix
+.Sh SYNOPSIS
+.Nm
+.Fl c Ar config-file
+.Sh DESCRIPTION
+.Nm
+is a high-performance Domain-based Message Authentication, Reporting, and
+Conformance (DMARC) milter implementing RFC 7489.
+It reads upstream SPF and DKIM Authentication-Results headers, evaluates
+DMARC policy alignment, and adds its own Authentication-Results header
+with the DMARC verdict.
+.Pp
+.Nm
+must be placed in the milter chain after both
+.Xr securespf 8
+and
+.Xr securedkim 8
+so that their Authentication-Results headers are available for evaluation.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl c Ar config-file
+Path to the INI-style configuration file.
+Required.
+.El
+.Sh CONFIGURATION
+The configuration file uses INI format with a
+.Ql [global]
+section and one or more
+.Ql [listener:name]
+sections.
+.Ss Global Section
+.Bl -tag -width "SyslogFacility" -compact
+.It Cm AuthservID
+Identifier for Authentication-Results headers.
+Must match the AuthservID used by
+.Nm securespf
+and
+.Nm securedkim
+so that their results can be parsed.
+Default:
+.Dq localhost .
+.It Cm WorkerThreads
+Number of worker threads.
+0 means auto-detect CPU count.
+Default: 0.
+.It Cm PidFile
+Path to the PID file.
+Default:
+.Pa /var/run/securedmarc/securedmarc.pid .
+.It Cm Foreground
+Run in foreground without daemonizing.
+Default: no.
+.It Cm User
+Drop privileges to this user after binding sockets.
+.It Cm Syslog
+Enable syslog output.
+Default: yes.
+.It Cm SyslogFacility
+Syslog facility.
+Default: mail.
+.It Cm LogLevel
+Logging verbosity: err, warn, info, debug.
+Default: info.
+.It Cm DnsNameserver
+Comma-separated DNS nameserver IPs.
+Default:
+.Dq 127.0.0.1 .
+.It Cm DnsTimeout
+DNS query timeout in seconds.
+Default: 5.
+.It Cm DnsRetries
+Number of DNS query retries.
+Default: 2.
+.It Cm DnsCacheSize
+Maximum DNS cache entries per worker.
+Default: 1000.
+.It Cm DnsNegativeTTL
+Negative cache TTL in seconds.
+Default: 60.
+.It Cm ZmqEndpoint
+ZeroMQ PUB endpoint for event publishing.
+Disabled if not set.
+.It Cm ZmqTopic
+ZeroMQ topic prefix.
+Default:
+.Dq dmarc.evaluation .
+.El
+.Ss Listener Sections
+Each
+.Ql [listener:name]
+section defines a socket to listen on.
+.Bl -tag -width "Socket" -compact
+.It Cm Socket
+Listen address.
+Format:
+.Dq inet:port@host
+or
+.Dq unix:/path .
+.El
+.Pp
+If no listener sections are defined, the default is
+.Dq inet:8894@0.0.0.0 .
+.Sh SIGNALS
+.Bl -tag -width "SIGTERM" -compact
+.It Dv SIGHUP
+Reload configuration.
+.It Dv SIGTERM
+Graceful shutdown with 30 second drain timeout.
+.El
+.Sh POSTFIX INTEGRATION
+.Nm
+must be ordered after SPF and DKIM milters:
+.Bd -literal -offset indent
+smtpd_milters = inet:127.0.0.1:8890,
+                inet:127.0.0.1:8891,
+                inet:127.0.0.1:8894
+milter_connect_macros = j {daemon_name} v {client_addr}
+milter_default_action = accept
+.Ed
+.Sh LOG FORMAT
+.Bd -literal -offset indent
+securedmarc[pid]: id=QUEUEID peer=HOST[IP] client=IP domain=DOMAIN elapsed=Nms
+.Ed
+.Sh EXIT STATUS
+.Ex -std
+.Sh FILES
+.Bl -tag -width "/usr/local/etc/securedmarc/securedmarc.conf"
+.It Pa /usr/local/etc/securedmarc/securedmarc.conf
+Default configuration file.
+.It Pa /var/run/securedmarc/securedmarc.pid
+Default PID file.
+.El
+.Sh SEE ALSO
+.Xr securespf 8 ,
+.Xr securedkim 8 ,
+.Xr securearc 8
+.Sh STANDARDS
+.Rs
+.%T Domain-based Message Authentication, Reporting, and Conformance (DMARC)
+.%R RFC 7489
+.Re
+.Sh AUTHORS
+.An Daniel Morante
