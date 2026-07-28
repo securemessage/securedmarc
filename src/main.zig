@@ -10,6 +10,7 @@ const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
+const auth_stamp = securemilter.auth_stamp;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -214,7 +215,9 @@ pub fn main() !void {
             g_psl = list;
         } else |err| {
             list.deinit();
-            log.err("failed to load PublicSuffixList {s}: {} — continuing on the DNS tree walk alone", .{ path, err });
+            // ASCII only: syslog renders an em dash as escaped bytes, and this is
+            // the line an operator reads when alignment starts degrading (A-12).
+            log.err("failed to load PublicSuffixList {s}: {}; continuing on the DNS tree walk alone", .{ path, err });
         }
     } else {
         // Say so explicitly: which of the two modes is in effect should be
@@ -374,13 +377,15 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     // from the one the reader is shown. Fail rather than choose.
     const from_count = countFromHeaders(conn);
     if (from_count > 1) {
-        addArHeaderSimple(conn, "fail", "multiple From header fields");
+        addArHeaderSimple(conn, "fail", "multiple From header fields") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
         return @intFromEnum(responses.Code.@"continue");
     }
 
     // Step 1: Extract From: domain
     const from_domain = getFromDomain(conn) orelse {
-        addArHeaderSimple(conn, "none", "no From header");
+        addArHeaderSimple(conn, "none", "no From header") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
         return @intFromEnum(responses.Code.@"continue");
     };
 
@@ -428,7 +433,8 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     const resolver = getResolver();
 
     var author_walk = treewalk.walk(conn.allocator, resolver, from_domain) catch {
-        addArHeaderSimple(conn, "temperror", "internal error");
+        addArHeaderSimple(conn, "temperror", "internal error") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
         return @intFromEnum(responses.Code.@"continue");
     };
     defer author_walk.deinit();
@@ -437,9 +443,11 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     // belonging to its Organizational or Public Suffix Domain applies.
     const rec = author_walk.recordAtStart() orelse author_walk.policyRecord() orelse {
         if (author_walk.transient_error) {
-            addArHeaderSimple(conn, "temperror", "DNS lookup failed");
+            addArHeaderSimple(conn, "temperror", "DNS lookup failed") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
         } else {
-            addArHeaderSimple(conn, "none", "no DMARC record found");
+            addArHeaderSimple(conn, "none", "no DMARC record found") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
         }
         return @intFromEnum(responses.Code.@"continue");
     };
@@ -463,7 +471,8 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 
     // Step 6: Add Authentication-Results header
     const disposition = dmarc.getDisposition(&rec, is_subdomain);
-    addArHeaderFull(conn, result.toString(), from_domain, disposition);
+    addArHeaderFull(conn, result.toString(), from_domain, disposition) catch |err|
+        return auth_stamp.deferCode(err, "dmarc");
 
     // Publish ZMQ event with full evaluation details
     publishEvent(
@@ -586,25 +595,24 @@ fn publishEvent(
     getPublisher().publish(json);
 }
 
-fn addArHeaderSimple(conn: *connection_mod.Connection, result_str: []const u8, reason: []const u8) void {
-    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+/// Record the DMARC result on the message.
+///
+/// Both stamping functions here returned `void` and swallowed every failure, so
+/// a message could be delivered carrying no `dmarc=` field while the daemon
+/// reported success (audit X-9). This daemon is the end of the chain: its field
+/// is what a downstream mailbox provider or a local delivery rule reads to decide
+/// disposition. Losing it silently means the message is treated as if DMARC was
+/// never evaluated, which for a `p=reject` domain is the difference between a
+/// rejection and a delivery.
+fn addArHeaderSimple(conn: *connection_mod.Connection, result_str: []const u8, reason: []const u8) !void {
+    try auth_stamp.stamp(conn.allocator, conn.fd, g_authserv_id, &.{
         .{
             .method = "dmarc",
             .result = result_str,
             .reason = reason,
             .properties = &.{},
         },
-    }) catch return;
-    defer conn.allocator.free(ar_value);
-
-    const hdr_payload = responses.addHeader(
-        conn.allocator,
-        "Authentication-Results",
-        ar_value,
-    ) catch return;
-    defer conn.allocator.free(hdr_payload);
-
-    codec.writePacket(conn.fd, hdr_payload) catch {};
+    });
 }
 
 fn addArHeaderFull(
@@ -612,11 +620,11 @@ fn addArHeaderFull(
     result_str: []const u8,
     from_domain: []const u8,
     disposition: []const u8,
-) void {
-    const reason = std.fmt.allocPrint(conn.allocator, "p={s}", .{disposition}) catch return;
+) !void {
+    const reason = try std.fmt.allocPrint(conn.allocator, "p={s}", .{disposition});
     defer conn.allocator.free(reason);
 
-    const ar_value = auth_results.build(conn.allocator, g_authserv_id, &.{
+    try auth_stamp.stamp(conn.allocator, conn.fd, g_authserv_id, &.{
         .{
             .method = "dmarc",
             .result = result_str,
@@ -627,17 +635,7 @@ fn addArHeaderFull(
                 .value = from_domain,
             }},
         },
-    }) catch return;
-    defer conn.allocator.free(ar_value);
-
-    const hdr_payload = responses.addHeader(
-        conn.allocator,
-        "Authentication-Results",
-        ar_value,
-    ) catch return;
-    defer conn.allocator.free(hdr_payload);
-
-    codec.writePacket(conn.fd, hdr_payload) catch {};
+    });
 }
 
 fn dupeOrNull(allocator: Allocator, s: []const u8) ?[]const u8 {
@@ -713,6 +711,31 @@ test "parse config minimal" {
 
     try std.testing.expectEqualStrings("mail.test.com", dmarc_cfg.authserv_id);
     try std.testing.expectEqual(@as(usize, 1), dmarc_cfg.listen_addresses.len);
+}
+
+// X-9: both wrappers must stay fallible.
+//
+// Both returned `void` and swallowed every failure, so a message could be
+// delivered with no `dmarc=` field while this daemon reported success. This
+// daemon is the end of the chain, so that field is the only record of the
+// verdict: losing it silently means the message is treated as though DMARC was
+// never evaluated, which for a `p=reject` domain is the difference between a
+// rejection and a delivery.
+test "the DMARC stamping wrappers cannot swallow failures" {
+    comptime {
+        for (.{ addArHeaderSimple, addArHeaderFull }) |f| {
+            const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+            if (@typeInfo(ret) != .error_union) @compileError(
+                "the DMARC stamping wrappers must return an error union. Swallowing a " ++
+                    "failure delivers the message with no dmarc= field while reporting " ++
+                    "success, and this daemon is the end of the chain: nothing downstream " ++
+                    "can reconstruct the verdict (audit X-9).",
+            );
+            if (@typeInfo(ret).error_union.payload != void) @compileError(
+                "the DMARC stamping wrappers should return !void.",
+            );
+        }
+    }
 }
 
 test "get from domain" {
