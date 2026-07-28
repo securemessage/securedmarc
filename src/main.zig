@@ -11,6 +11,7 @@ const worker_mod = securemilter.worker;
 const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
+const escape = securemilter.escape;
 const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
@@ -359,7 +360,19 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const client_addr = conn.macros.client_addr orelse "unknown";
     const from_domain = getFromDomain(conn) orelse "unknown";
     const peer = conn.getPeerDisplay();
-    log.info("id={s} peer={s}[{s}] client={s} domain={s} elapsed={d}ms", .{ queue_id, peer.name, peer.ip, client_addr, from_domain, elapsed_ms });
+    // `domain` here is taken from the message's own `From:` field, which is
+    // entirely sender-chosen and may be folded across lines -- so its unfolded
+    // value can begin with whitespace or contain a bare LF. Unescaped, that
+    // either forged a second syslog line or made `elapsed=` look like this
+    // field's value. This is the field the x5a probe reported (audit X-5).
+    log.info("id={f} peer={f}[{f}] client={f} domain={f} elapsed={d}ms", .{
+        escape.logField(queue_id),
+        escape.logField(peer.name),
+        escape.logField(peer.ip),
+        escape.logField(client_addr),
+        escape.logField(from_domain),
+        elapsed_ms,
+    });
     return result;
 }
 
@@ -587,9 +600,22 @@ fn publishEvent(
     dkim_domain_str: []const u8,
     envelope_from: []const u8,
 ) void {
+    // `from_domain`, `dkim_domain_str` and `envelope_from` all originate in the
+    // message or its envelope, so each is sender-chosen; the three result strings
+    // and the disposition are ours. A `"` in any sender-chosen value used to end
+    // its JSON string early and leave the rest of the payload to be reinterpreted
+    // by the consumer (audit X-5).
     const json = std.fmt.allocPrint(allocator,
-        \\{{"from_domain":"{s}","result":"{s}","disposition":"{s}","spf_result":"{s}","dkim_result":"{s}","dkim_domain":"{s}","envelope_from":"{s}"}}
-    , .{ from_domain, result_str, disposition, spf_result_str, dkim_result_str, dkim_domain_str, envelope_from }) catch return;
+        \\{{"from_domain":"{f}","result":"{s}","disposition":"{s}","spf_result":"{s}","dkim_result":"{s}","dkim_domain":"{f}","envelope_from":"{f}"}}
+    , .{
+        escape.jsonString(from_domain),
+        result_str,
+        disposition,
+        spf_result_str,
+        dkim_result_str,
+        escape.jsonString(dkim_domain_str),
+        escape.jsonString(envelope_from),
+    }) catch return;
     defer allocator.free(json);
 
     getPublisher().publish(json);
