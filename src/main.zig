@@ -231,6 +231,13 @@ pub fn main() !void {
         log.initThread(); // re-init after fork (PID changed)
     }
 
+    // Block the managed signals BEFORE spawning any thread, so every thread
+    // inherits the mask and SIGHUP/SIGTERM can only be taken by sigwait in the
+    // main thread. Ordering matters: this used to sit just above the worker
+    // pool, leaving the health monitor thread below with SIGHUP unblocked and
+    // able to take a reload signal and terminate the daemon (audit X-7).
+    daemon_mod.ManagedSignals.blockForKqueue();
+
     // Start proactive DNS health monitor AFTER daemonize
     if (dns_mod.HealthMonitor.init(allocator, dmarc_cfg.dns_nameservers, 53, 5, 2000)) |monitor| {
         monitor.start() catch |err| {
@@ -281,8 +288,6 @@ pub fn main() !void {
 
     const shutdown_pipe = try posix.pipe();
     defer posix.close(shutdown_pipe[0]);
-
-    daemon_mod.ManagedSignals.blockForKqueue();
 
     var threads = try worker_mod.spawnPoolWithReload(
         allocator,
