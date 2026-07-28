@@ -67,7 +67,21 @@ each remove forged claims for their own method before adding the real one.
 Default: no.
 .It Cm PublicSuffixList
 Path to a Public Suffix List file, used only to veto a DNS tree walk result.
-Recommended, though not required.
+Recommended for now, though not required.
+.Pp
+.Sy Deprecated .
+This option covers the transition to RFC 9989 and is expected to be removed in
+a future version.
+RFC 9989 replaced the Public Suffix List with the DNS tree walk outright, and
+observes that relying on a PSL
+.Dq might arrive at a different answer
+than the walk does, so consulting one at all is a deliberate deviation from
+the standard \(em constrained here so that it can only reject a boundary the
+walk selected, never select one itself.
+As
+.Li psd=
+is published more widely the veto has less and less to reject.
+Do not build anything on this option that would break when it is removed.
 .Pp
 Organizational domains are determined by the RFC 9989 DNS tree walk:
 .Nm

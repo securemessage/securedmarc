@@ -4,6 +4,14 @@ const Allocator = mem.Allocator;
 
 /// Public Suffix List, used only as a veto over the DNS tree walk.
 ///
+/// DEPRECATED. This module covers the transition to RFC 9989 and is expected
+/// to be removed. The RFC replaced the PSL with the tree walk outright and
+/// observes that a PSL "might arrive at a different answer" than the walk, so
+/// consulting one at all is a deliberate deviation, kept narrow on purpose:
+/// it may only reject a boundary the walk selected, never select one. Once
+/// psd= is widely published there is nothing left for it to reject and this
+/// file and the PublicSuffixList option should both go.
+///
 /// RFC 9989 replaced the PSL with the tree walk, and the tree walk is what
 /// decides the Organizational Domain here. The list covers one residual gap:
 /// tree-walk rule 3 picks the shortest name that published a DMARC record, on

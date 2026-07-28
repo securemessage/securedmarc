@@ -35,6 +35,15 @@ AuthservID      = mail.example.com
 # The file is read once at startup. It changes as registries come and go, so
 # refresh it periodically — the package is rebuilt regularly — and restart the
 # daemon afterwards. SIGHUP does not reload it.
+#
+# DEPRECATED. This option exists only to cover the transition to RFC 9989 and
+# is expected to be removed in a future version. The RFC replaced the Public
+# Suffix List with the DNS tree walk outright, and observes that a PSL "might
+# arrive at a different answer" than the walk — so keeping the list is a
+# deliberate deviation from the standard, constrained here so it can only
+# reject a boundary the walk chose and never choose one itself. As psd= gets
+# published more widely the veto stops finding anything to reject. Do not
+# build anything on this option that would break when it goes away.
 PublicSuffixList = /usr/local/share/public_suffix_list/public_suffix_list.dat
 
 WorkerThreads   = 0
