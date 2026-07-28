@@ -17,6 +17,7 @@ const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
+const header_scrub = securemilter.header_scrub;
 
 pub const dmarc = @import("dmarc.zig");
 pub const alignment = @import("alignment.zig");
@@ -36,6 +37,7 @@ pub const DmarcConfig = struct {
     dns_negative_ttl: u32,
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
+    strip_auth_results: bool,
 };
 
 const reload_mod = securemilter.reload;
@@ -45,6 +47,7 @@ var g_authserv_id: []const u8 = "localhost";
 var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dmarc.evaluation";
+var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dmarc"} };
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
 
@@ -101,6 +104,12 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dmarc.evaluation");
 
+    // Trust boundary. Off by default: DMARC reads the spf= and dkim= results
+    // that SecureSPF and SecureDKIM added earlier in the same milter chain, and
+    // those carry our authserv-id too. Only enable where no other SecureMilter
+    // daemon precedes this one.
+    const strip_auth_results = global.getBool("StripAuthResults", false);
+
     return .{
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
@@ -115,6 +124,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .dns_negative_ttl = dns_negative_ttl,
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
+        .strip_auth_results = strip_auth_results,
     };
 }
 
@@ -163,6 +173,7 @@ pub fn main() !void {
 
     g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
     g_zmq_topic = dmarc_cfg.zmq_topic;
+    g_strip_policy = .{ .own_methods = &.{"dmarc"}, .strip_all = dmarc_cfg.strip_auth_results };
 
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dmarc_cfg.foreground) {
@@ -206,7 +217,7 @@ pub fn main() !void {
         dmarc_cfg.listen_addresses.len,
     });
 
-    const required_actions = negotiate.ActionFlags{ .add_headers = true };
+    const required_actions = negotiate.ActionFlags{ .add_headers = true, .change_headers = true };
 
     const callbacks = worker_mod.Callbacks{
         .on_connect = onConnect,
@@ -280,6 +291,12 @@ fn onBody(conn: *connection_mod.Connection, _: []const u8) u8 {
 
 fn onEom(conn: *connection_mod.Connection) u8 {
     const start_ns = std.time.nanoTimestamp();
+
+    // Drop forged dmarc= claims before evaluating. The spf= and dkim= results
+    // this evaluation consumes were scrubbed of forgeries by SecureSPF and
+    // SecureDKIM earlier in the chain; what survives here was produced by them.
+    _ = header_scrub.stripAuthResults(conn, g_authserv_id, g_strip_policy);
+
     const result = doDmarcEvaluation(conn);
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
@@ -581,6 +598,7 @@ test "parse config minimal" {
 
     const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
     defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
+    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
 
     try std.testing.expectEqualStrings("mail.test.com", dmarc_cfg.authserv_id);
     try std.testing.expectEqual(@as(usize, 1), dmarc_cfg.listen_addresses.len);

@@ -1,5 +1,17 @@
 [global]
 AuthservID      = mail.example.com
+
+# Trust boundary (RFC 8601 section 5).
+# SecureDMARC always removes pre-existing Authentication-Results headers that
+# claim our AuthservID and assert a dmarc= result.
+# It must NOT remove the spf= and dkim= results, because those are the inputs
+# it evaluates: SecureSPF and SecureDKIM add them earlier in the same milter
+# chain under this same AuthservID, having already removed any forged claims
+# for their own methods.
+# Only enable this where no other SecureMilter daemon precedes SecureDMARC —
+# in that case DMARC has no authentication inputs at all and every message
+# will fail alignment.
+# StripAuthResults = no
 WorkerThreads   = 0
 Foreground      = no
 PidFile         = /var/run/securedmarc/securedmarc.pid

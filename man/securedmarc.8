@@ -46,6 +46,25 @@ and
 so that their results can be parsed.
 Default:
 .Dq localhost .
+.It Cm StripAuthResults
+Remove every pre-existing Authentication-Results header claiming our
+.Cm AuthservID ,
+not just the ones asserting a
+.Li dmarc=
+result.
+Enable this only where no other SecureMilter daemon precedes
+.Nm :
+otherwise it also discards the
+.Li spf=
+and
+.Li dkim=
+results this daemon evaluates, and every message fails alignment.
+Those inputs are already protected \(em
+.Xr securespf 8
+and
+.Xr securedkim 8
+each remove forged claims for their own method before adding the real one.
+Default: no.
 .It Cm WorkerThreads
 Number of worker threads.
 0 means auto-detect CPU count.
