@@ -91,9 +91,18 @@ pub const PublicSuffixList = struct {
     }
 
     fn insert(self: *PublicSuffixList, map: *std.StringHashMapUnmanaged(void), rule: []const u8) !void {
-        if (rule.len == 0) return;
-        if (map.contains(rule)) return;
-        const owned = try lowerDupe(self.allocator, rule);
+        if (rule.len == 0 or rule.len > MAX_DOMAIN_LEN) return;
+
+        // Normalise before the duplicate check, not after. Testing the raw
+        // rule against a map keyed by lowercase misses a mixed-case repeat,
+        // and `put` on an already-present key keeps the original key — the
+        // freshly allocated one would then be unreachable and never freed.
+        var buf: [MAX_DOMAIN_LEN]u8 = undefined;
+        for (rule, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+        const key = buf[0..rule.len];
+
+        if (map.contains(key)) return;
+        const owned = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned);
         try map.put(self.allocator, owned, {});
     }
@@ -109,12 +118,6 @@ fn parentOf(domain: []const u8) ?[]const u8 {
     const dot = mem.indexOfScalar(u8, domain, '.') orelse return null;
     const parent = domain[dot + 1 ..];
     return if (parent.len == 0) null else parent;
-}
-
-fn lowerDupe(allocator: Allocator, s: []const u8) ![]u8 {
-    const buf = try allocator.alloc(u8, s.len);
-    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf;
 }
 
 fn freeKeys(allocator: Allocator, map: *std.StringHashMapUnmanaged(void)) void {
@@ -177,4 +180,30 @@ test "duplicate rules are stored once" {
     defer list.deinit();
     try list.loadText("com\ncom\ncom\n");
     try std.testing.expectEqual(@as(usize, 1), list.count());
+}
+
+test "duplicate rules differing only in case are stored once" {
+    // Both orderings: the second insert must be recognised as a repeat rather
+    // than allocating a key that `put` would then discard. std.testing's
+    // allocator fails the test if that key leaks.
+    var lower_first = PublicSuffixList.init(std.testing.allocator);
+    defer lower_first.deinit();
+    try lower_first.loadText("co.uk\nCO.UK\nCo.Uk\n");
+    try std.testing.expectEqual(@as(usize, 1), lower_first.count());
+    try std.testing.expect(lower_first.isPublicSuffix("co.uk"));
+
+    var upper_first = PublicSuffixList.init(std.testing.allocator);
+    defer upper_first.deinit();
+    try upper_first.loadText("CO.UK\nco.uk\n");
+    try std.testing.expectEqual(@as(usize, 1), upper_first.count());
+    try std.testing.expect(upper_first.isPublicSuffix("CO.UK"));
+}
+
+test "rules longer than a domain name are ignored" {
+    var list = PublicSuffixList.init(std.testing.allocator);
+    defer list.deinit();
+    const too_long = "a" ** (MAX_DOMAIN_LEN + 1);
+    try list.loadText(too_long ++ "\ncom\n");
+    try std.testing.expectEqual(@as(usize, 1), list.count());
+    try std.testing.expect(list.isPublicSuffix("com"));
 }
