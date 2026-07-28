@@ -209,6 +209,10 @@ pub fn main() !void {
             list.deinit();
             log.err("failed to load PublicSuffixList {s}: {} — continuing on the DNS tree walk alone", .{ path, err });
         }
+    } else {
+        // Say so explicitly: which of the two modes is in effect should be
+        // readable from the log, not inferred from the absence of a line.
+        log.info("no PublicSuffixList configured; organizational domains come from the DNS tree walk alone", .{});
     }
 
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
@@ -644,8 +648,11 @@ fn toLower(c: u8) u8 {
 // Reload
 // =============================================================================
 
-/// Main-thread reload callback. SecureDMARC reads DMARC records from DNS per
-/// message, so the only reloadable state is the optional public suffix list.
+/// Main-thread reload callback. SecureDMARC holds no reloadable file state:
+/// DMARC records are read from DNS per message, and the optional public suffix
+/// list is loaded once at startup. Swapping that list under running workers
+/// would free memory they are reading, so refreshing it requires a restart
+/// until the RCU config container exists (audit X-2).
 fn reloadConfig() void {
     g_config_gen.increment();
     log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});

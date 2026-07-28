@@ -14,16 +14,28 @@ AuthservID      = mail.example.com
 # StripAuthResults = no
 
 # Organizational domains come from the RFC 9989 DNS tree walk: SecureDMARC
-# walks up _dmarc.<name> and lets each zone declare its own boundary with the
-# psd= tag, so no external list is required.
+# walks up _dmarc.<name> and each zone declares its own boundary with the psd=
+# tag. No external list is required and the daemon is correct without one.
 #
-# The tree walk assumes a public suffix that publishes a DMARC record also
-# publishes psd=y. A registry that forgets the tag could otherwise be selected
-# as an organizational domain shared by all of its registrants. Point this at
-# a Public Suffix List (FreeBSD: dns/public_suffix_list) to veto that case.
-# The list can only reject a boundary, never choose one, and the daemon runs
-# on the tree walk alone when it is absent.
-# PublicSuffixList = /usr/local/share/public_suffix_list/public_suffix_list.dat
+# Recommended anyway, for now. The tree walk's last resort is the shortest
+# name that published a DMARC record, which assumes a public suffix publishing
+# DMARC also publishes psd=y. RFC 9989 is recent and psd= is not yet widely
+# deployed, so a registry that publishes a record without the tag would be
+# selected as an organizational domain shared by all of its registrants — the
+# boundary collapse that lets attacker.co.uk align with victim.co.uk. A Public
+# Suffix List rejects that. It can only reject a boundary, never choose one.
+#
+# Install the list from packages:
+#
+#     pkg install public_suffix_list
+#
+# or fetch it yourself from https://publicsuffix.org/list/ (MPL 2.0) and point
+# this at wherever you put it.
+#
+# The file is read once at startup. It changes as registries come and go, so
+# refresh it periodically — the package is rebuilt regularly — and restart the
+# daemon afterwards. SIGHUP does not reload it.
+PublicSuffixList = /usr/local/share/public_suffix_list/public_suffix_list.dat
 
 WorkerThreads   = 0
 Foreground      = no

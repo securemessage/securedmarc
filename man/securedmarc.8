@@ -67,6 +67,7 @@ each remove forged claims for their own method before adding the real one.
 Default: no.
 .It Cm PublicSuffixList
 Path to a Public Suffix List file, used only to veto a DNS tree walk result.
+Recommended, though not required.
 .Pp
 Organizational domains are determined by the RFC 9989 DNS tree walk:
 .Nm
@@ -74,19 +75,46 @@ walks up
 .Li _dmarc.<name>
 and each zone declares its own boundary with the
 .Li psd=
-tag, so no external list is needed.
-The walk does assume that a public suffix publishing a DMARC record also
-publishes
-.Li psd=y ;
-a registry that omits the tag could otherwise be chosen as an organizational
-domain shared by every registrant beneath it.
-With this option set, such a boundary is rejected.
+tag, so no external list is needed and
+.Nm
+is correct without one.
+The walk's last resort, however, is the shortest name that published a DMARC
+record, which assumes a public suffix publishing DMARC also publishes
+.Li psd=y .
+RFC 9989 is recent and
+.Li psd=
+is not yet widely deployed, so a registry publishing a record without the tag
+would be chosen as an organizational domain shared by every registrant beneath
+it — the boundary collapse that lets
+.Li attacker.co.uk
+align with
+.Li victim.co.uk .
+Setting this option rejects such a boundary.
 The list may only reject a boundary, never choose one, and
 .Nm
-runs on the tree walk alone when the option is unset or the file cannot be
-read.
-On FreeBSD the list is packaged as
-.Pa dns/public_suffix_list .
+falls back to the tree walk alone when the option is unset or the file cannot
+be read; which mode is in effect is reported at startup.
+.Pp
+Install the list from packages with
+.Dl pkg install public_suffix_list
+which provides
+.Pa /usr/local/share/public_suffix_list/public_suffix_list.dat ,
+or download it from
+.Lk https://publicsuffix.org/list/
+(MPL 2.0) and point this option at it.
+The file is parsed once at startup: rules are one per line, with
+.Ql //
+comments,
+.Ql *
+wildcard labels and
+.Ql \&!
+exceptions.
+Because the list changes as registries come and go, refresh it periodically
+and restart
+.Nm
+afterwards —
+.Dv SIGHUP
+does not reload it.
 Default: unset.
 .It Cm WorkerThreads
 Number of worker threads.
@@ -178,6 +206,11 @@ securedmarc[pid]: id=QUEUEID peer=HOST[IP] client=IP domain=DOMAIN elapsed=Nms
 Default configuration file.
 .It Pa /var/run/securedmarc/securedmarc.pid
 Default PID file.
+.It Pa /usr/local/share/public_suffix_list/public_suffix_list.dat
+Public Suffix List as installed by the
+.Pa dns/public_suffix_list
+package, for use with
+.Cm PublicSuffixList .
 .El
 .Sh SEE ALSO
 .Xr securespf 8 ,
