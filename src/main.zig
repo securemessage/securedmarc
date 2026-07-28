@@ -654,7 +654,10 @@ fn toLower(c: u8) u8 {
 /// would free memory they are reading, so refreshing it requires a restart
 /// until the RCU config container exists (audit X-2).
 fn reloadConfig() void {
-    g_config_gen.increment();
+    _ = g_config_gen.increment();
+    // Wake the workers so they notice the new generation and drop their cached
+    // resolver promptly, rather than on their next message.
+    g_config_gen.wake();
     log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});
 }
 
