@@ -315,6 +315,16 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 /// 4. Parse DMARC record, check alignment, determine result
 /// 5. Add our own A-R header with DMARC result
 fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
+    // Step 0: A message with more than one From field has no single author
+    // domain to evaluate. RFC 5322 forbids it and RFC 7489 §6.6.1 declines to
+    // guess; picking one instance means the domain we authenticate can differ
+    // from the one the reader is shown. Fail rather than choose.
+    const from_count = countFromHeaders(conn);
+    if (from_count > 1) {
+        addArHeaderSimple(conn, "fail", "multiple From header fields");
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
     // Step 1: Extract From: domain
     const from_domain = getFromDomain(conn) orelse {
         addArHeaderSimple(conn, "none", "no From header");
@@ -423,6 +433,14 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+fn countFromHeaders(conn: *connection_mod.Connection) usize {
+    var count: usize = 0;
+    for (conn.headers.items) |hdr| {
+        if (eqlIgnoreCase(hdr.name, "From")) count += 1;
+    }
+    return count;
+}
 
 fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
     for (conn.headers.items) |hdr| {
