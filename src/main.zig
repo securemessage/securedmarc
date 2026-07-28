@@ -41,6 +41,7 @@ pub const DmarcConfig = struct {
     zmq_topic: []const u8,
     strip_auth_results: bool,
     public_suffix_list: ?[]const u8,
+    limits: connection_mod.Limits,
 };
 
 const reload_mod = securemilter.reload;
@@ -131,6 +132,11 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     // Optional Public Suffix List, used only to veto a tree-walk result.
     const public_suffix_list = global.get("PublicSuffixList");
 
+    // Caps on attacker-controlled message content (audit X-4). DMARC reads the
+    // From header and the spf=/dkim= results, so an uninspected header block is
+    // exactly what it must not evaluate against.
+    const limits = connection_mod.Limits.fromSection(global);
+
     return .{
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
@@ -147,6 +153,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .zmq_topic = zmq_topic,
         .strip_auth_results = strip_auth_results,
         .public_suffix_list = public_suffix_list,
+        .limits = limits,
     };
 }
 
@@ -269,6 +276,7 @@ pub fn main() !void {
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
+        .limits = dmarc_cfg.limits,
     };
 
     const shutdown_pipe = try posix.pipe();

@@ -58,5 +58,22 @@ DnsRetries      = 2
 ZmqEndpoint     = tcp://events.internal:5555
 ZmqTopic        = dmarc
 
+# --- Resource limits on attacker-controlled message content ---
+#
+# Both take effect at startup, not on SIGHUP. 0 disables the limit.
+#
+# DMARC is evaluated from the From header plus the spf= and dkim= results added
+# earlier in the milter chain, so this daemon never buffers a message body and
+# has no MaxBodyBytes. The header block is what it reads, and an uninspected
+# header block is exactly what it must not evaluate against.
+#
+# A message whose header block exceeds either limit is tempfailed rather than
+# delivered: headers past the limit are never seen, so neither a forged
+# Authentication-Results nor a second From header hidden beyond it could be
+# acted on. Raise these if legitimate mail crossing many forwarders and mailing
+# lists is being deferred.
+# MaxHeaders     = 500
+# MaxHeaderBytes = 1M
+
 [listener:inbound]
 Socket          = inet:8894@0.0.0.0

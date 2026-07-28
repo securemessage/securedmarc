@@ -168,6 +168,43 @@ Default: 1000.
 .It Cm DnsNegativeTTL
 Negative cache TTL in seconds.
 Default: 60.
+.It Cm MaxHeaders
+Largest number of headers accumulated for one message.
+Default: 500.
+0 disables the limit.
+.It Cm MaxHeaderBytes
+Largest total header size, names plus values, accumulated for one message.
+Accepts an optional
+.Cm K , Cm M
+or
+.Cm G
+suffix.
+Default: 1M.
+0 disables the limit.
+.Pp
+DMARC is evaluated from the
+.Cm From
+header together with the
+.Cm spf=
+and
+.Cm dkim=
+results added earlier in the milter chain, so
+.Nm
+never buffers a message body and has no
+.Cm MaxBodyBytes .
+The header block is precisely what it reads.
+.Pp
+A message exceeding either limit is tempfailed rather than delivered.
+Headers past the limit are never read, so neither a forged
+.Cm Authentication-Results
+nor a second
+.Cm From
+header hidden beyond the limit could be acted on.
+Raise these if legitimate mail crossing many forwarders and mailing lists is
+being deferred.
+Both are read at startup only;
+.Dv SIGHUP
+does not change them.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.
