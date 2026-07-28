@@ -12,6 +12,19 @@ AuthservID      = mail.example.com
 # in that case DMARC has no authentication inputs at all and every message
 # will fail alignment.
 # StripAuthResults = no
+
+# Organizational domains come from the RFC 9989 DNS tree walk: SecureDMARC
+# walks up _dmarc.<name> and lets each zone declare its own boundary with the
+# psd= tag, so no external list is required.
+#
+# The tree walk assumes a public suffix that publishes a DMARC record also
+# publishes psd=y. A registry that forgets the tag could otherwise be selected
+# as an organizational domain shared by all of its registrants. Point this at
+# a Public Suffix List (FreeBSD: dns/public_suffix_list) to veto that case.
+# The list can only reject a boundary, never choose one, and the daemon runs
+# on the tree walk alone when it is absent.
+# PublicSuffixList = /usr/local/share/public_suffix_list/public_suffix_list.dat
+
 WorkerThreads   = 0
 Foreground      = no
 PidFile         = /var/run/securedmarc/securedmarc.pid

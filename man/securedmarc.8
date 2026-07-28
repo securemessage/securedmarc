@@ -65,6 +65,29 @@ and
 .Xr securedkim 8
 each remove forged claims for their own method before adding the real one.
 Default: no.
+.It Cm PublicSuffixList
+Path to a Public Suffix List file, used only to veto a DNS tree walk result.
+.Pp
+Organizational domains are determined by the RFC 9989 DNS tree walk:
+.Nm
+walks up
+.Li _dmarc.<name>
+and each zone declares its own boundary with the
+.Li psd=
+tag, so no external list is needed.
+The walk does assume that a public suffix publishing a DMARC record also
+publishes
+.Li psd=y ;
+a registry that omits the tag could otherwise be chosen as an organizational
+domain shared by every registrant beneath it.
+With this option set, such a boundary is rejected.
+The list may only reject a boundary, never choose one, and
+.Nm
+runs on the tree walk alone when the option is unset or the file cannot be
+read.
+On FreeBSD the list is packaged as
+.Pa dns/public_suffix_list .
+Default: unset.
 .It Cm WorkerThreads
 Number of worker threads.
 0 means auto-detect CPU count.

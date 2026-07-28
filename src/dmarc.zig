@@ -45,6 +45,23 @@ pub const Result = enum {
     }
 };
 
+/// Value of the psd= tag (RFC 9989 §4.10.2).
+pub const Psd = enum {
+    /// psd=y — this domain is a Public Suffix Domain; the Organizational
+    /// Domain is one label below it.
+    yes,
+    /// psd=n — this domain is itself the Organizational Domain.
+    no,
+    /// psd=u or absent — boundary undeclared, decided by the tree walk.
+    unknown,
+
+    pub fn fromString(s: []const u8) Psd {
+        if (eqlIgnoreCase(s, "y")) return .yes;
+        if (eqlIgnoreCase(s, "n")) return .no;
+        return .unknown;
+    }
+};
+
 /// Parsed DMARC record (RFC 7489 §6.3).
 pub const DmarcRecord = struct {
     /// Domain policy (p=). Required.
@@ -63,6 +80,10 @@ pub const DmarcRecord = struct {
     ruf: ?[]const u8 = null,
     /// Failure reporting options (fo=). Default: "0".
     fo: []const u8 = "0",
+    /// Public-suffix declaration (psd=), RFC 9989 §4.10.
+    /// The domain states whether it is a Public Suffix Domain. Absent means
+    /// "unknown", which leaves the boundary for the DNS tree walk to work out.
+    psd: Psd = .unknown,
 
     /// Get the effective subdomain policy.
     pub fn getSubdomainPolicy(self: *const DmarcRecord) Policy {
@@ -121,6 +142,8 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
             record.ruf = val;
         } else if (eqlIgnoreCase(tag, "fo")) {
             record.fo = val;
+        } else if (eqlIgnoreCase(tag, "psd")) {
+            record.psd = Psd.fromString(val);
         }
     }
 
@@ -135,50 +158,26 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
 /// RFC 7489 §4.2: A message passes DMARC if at least one of:
 /// - SPF passes AND the SPF-authenticated domain aligns with From domain
 /// - DKIM passes AND a DKIM-authenticated domain aligns with From domain
+///
+/// `from_org_domain` is the Author Domain's Organizational Domain as
+/// established by the DNS tree walk; each identifier carries its own.
 pub fn evaluate(
     record: *const DmarcRecord,
     from_domain: []const u8,
-    spf_result: ?[]const u8,
-    spf_domain: ?[]const u8,
-    dkim_result: ?[]const u8,
-    dkim_domain: ?[]const u8,
-    is_subdomain: bool,
+    from_org_domain: []const u8,
+    spf: alignment.Identifier,
+    dkim: alignment.Identifier,
 ) Result {
-    var spf_aligned = false;
-    var dkim_aligned = false;
+    const spf_aligned = spf.passed() and
+        alignment.isAligned(from_domain, from_org_domain, spf, record.aspf);
 
-    // Check SPF alignment
-    if (spf_result) |sr| {
-        if (eqlIgnoreCase(sr, "pass")) {
-            if (spf_domain) |sd| {
-                spf_aligned = alignment.isAligned(from_domain, sd, record.aspf);
-            }
-        }
-    }
+    const dkim_aligned = dkim.passed() and
+        alignment.isAligned(from_domain, from_org_domain, dkim, record.adkim);
 
-    // Check DKIM alignment
-    if (dkim_result) |dr| {
-        if (eqlIgnoreCase(dr, "pass")) {
-            if (dkim_domain) |dd| {
-                dkim_aligned = alignment.isAligned(from_domain, dd, record.adkim);
-            }
-        }
-    }
-
-    // Pass if either mechanism is aligned
-    if (spf_aligned or dkim_aligned) return .pass;
-
-    // Determine effective policy
-    const effective_policy = if (is_subdomain)
-        record.getSubdomainPolicy()
-    else
-        record.policy;
-
-    // Even though the message failed alignment, the DMARC *result* is "fail"
-    // regardless of the policy disposition. The policy determines what ACTION
-    // the MTA takes, not the result value in the A-R header.
-    _ = effective_policy;
-    return .fail;
+    // Pass if either mechanism is aligned. The DMARC *result* is "fail"
+    // otherwise, regardless of policy: the policy determines the action the
+    // MTA takes, not the result value in the A-R header.
+    return if (spf_aligned or dkim_aligned) .pass else .fail;
 }
 
 /// Get the disposition action string for an A-R header reason comment.
@@ -227,6 +226,20 @@ test "parse minimal DMARC record" {
     try std.testing.expectEqual(@as(u8, 100), r.pct);
 }
 
+test "parse psd tag" {
+    const y = parseRecord("v=DMARC1; p=reject; psd=y") orelse return error.ParseFailed;
+    try std.testing.expectEqual(Psd.yes, y.psd);
+
+    const n = parseRecord("v=DMARC1; p=none; psd=n") orelse return error.ParseFailed;
+    try std.testing.expectEqual(Psd.no, n.psd);
+
+    // psd=u and an absent tag both leave the boundary undeclared.
+    const u = parseRecord("v=DMARC1; p=none; psd=u") orelse return error.ParseFailed;
+    try std.testing.expectEqual(Psd.unknown, u.psd);
+    const absent = parseRecord("v=DMARC1; p=none") orelse return error.ParseFailed;
+    try std.testing.expectEqual(Psd.unknown, absent.psd);
+}
+
 test "parse full DMARC record" {
     const r = parseRecord("v=DMARC1; p=reject; sp=quarantine; adkim=s; aspf=s; pct=50; rua=mailto:dmarc@example.com") orelse return error.ParseFailed;
     try std.testing.expectEqual(Policy.reject, r.policy);
@@ -252,26 +265,64 @@ test "reject invalid records" {
 
 test "evaluate pass with SPF aligned" {
     const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
-    const result = evaluate(&record, "example.com", "pass", "mail.example.com", null, null, false);
-    try std.testing.expectEqual(Result.pass, result);
+    const spf = alignment.Identifier{
+        .domain = "mail.example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+    };
+    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, .{}));
 }
 
 test "evaluate pass with DKIM aligned" {
     const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
-    const result = evaluate(&record, "example.com", "fail", "other.com", "pass", "example.com", false);
-    try std.testing.expectEqual(Result.pass, result);
+    const spf = alignment.Identifier{
+        .domain = "other.com",
+        .org_domain = "other.com",
+        .result = "fail",
+    };
+    const dkim = alignment.Identifier{
+        .domain = "example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+    };
+    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, dkim));
 }
 
 test "evaluate fail neither aligned" {
     const record = DmarcRecord{ .policy = .reject, .aspf = .strict, .adkim = .strict };
-    const result = evaluate(&record, "example.com", "pass", "other.com", "pass", "different.com", false);
-    try std.testing.expectEqual(Result.fail, result);
+    const spf = alignment.Identifier{ .domain = "other.com", .result = "pass" };
+    const dkim = alignment.Identifier{ .domain = "different.com", .result = "pass" };
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, dkim));
 }
 
 test "evaluate fail SPF pass but not aligned strict" {
     const record = DmarcRecord{ .policy = .quarantine, .aspf = .strict };
-    const result = evaluate(&record, "example.com", "pass", "mail.example.com", null, null, false);
-    try std.testing.expectEqual(Result.fail, result);
+    const spf = alignment.Identifier{
+        .domain = "mail.example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+    };
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, .{}));
+}
+
+test "evaluate fail when public suffixes no longer collapse" {
+    // M-2: the SPF identity really did pass, but the two registrants under
+    // co.uk have distinct organizational domains, so relaxed alignment fails.
+    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
+    const spf = alignment.Identifier{
+        .domain = "attacker.co.uk",
+        .org_domain = "attacker.co.uk",
+        .result = "pass",
+    };
+    try std.testing.expectEqual(
+        Result.fail,
+        evaluate(&record, "a.victim.co.uk", "victim.co.uk", spf, .{}),
+    );
+}
+
+test "evaluate fail when no identifier authenticated" {
+    const record = DmarcRecord{ .policy = .reject };
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", .{}, .{}));
 }
 
 test "subdomain policy" {

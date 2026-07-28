@@ -9,50 +9,49 @@ pub const AlignmentMode = enum {
     strict,
 };
 
-/// Check if an authenticated identifier (SPF domain or DKIM d= domain)
-/// aligns with the RFC5322.From header domain.
+/// An authenticated identifier and the Organizational Domain established for
+/// it by the DNS tree walk (RFC 9989 §4.10.2).
+pub const Identifier = struct {
+    /// Authenticated domain: the SPF MAIL FROM domain, or a DKIM d= value.
+    domain: ?[]const u8 = null,
+    /// Organizational Domain of `domain`. Only consulted for relaxed mode.
+    org_domain: ?[]const u8 = null,
+    /// The method result as reported by the milter that produced it.
+    result: ?[]const u8 = null,
+
+    pub fn passed(self: Identifier) bool {
+        const r = self.result orelse return false;
+        return eqlIgnoreCase(r, "pass");
+    }
+};
+
+/// Check if an authenticated identifier aligns with the RFC5322.From domain.
 ///
-/// RFC 7489 §3.1:
-/// - Strict: exact case-insensitive match
-/// - Relaxed: organizational domain of both must match
-pub fn isAligned(from_domain: []const u8, auth_domain: []const u8, mode: AlignmentMode) bool {
+/// - Strict: exact case-insensitive match of the domains themselves.
+/// - Relaxed: the two Organizational Domains must match.
+///
+/// Organizational Domains are supplied by the caller rather than derived here.
+/// They come from a DNS tree walk, because the registry/registrant boundary is
+/// not something that can be computed from a domain name: counting labels gets
+/// `victim.co.uk` and `attacker.co.uk` wrong in a way that aligns unrelated
+/// registrants with each other.
+pub fn isAligned(
+    from_domain: []const u8,
+    from_org: []const u8,
+    auth: Identifier,
+    mode: AlignmentMode,
+) bool {
+    const auth_domain = auth.domain orelse return false;
     if (from_domain.len == 0 or auth_domain.len == 0) return false;
 
     return switch (mode) {
         .strict => eqlIgnoreCase(from_domain, auth_domain),
-        .relaxed => {
-            const from_org = getOrganizationalDomain(from_domain);
-            const auth_org = getOrganizationalDomain(auth_domain);
-            return eqlIgnoreCase(from_org, auth_org);
+        .relaxed => blk: {
+            const auth_org = auth.org_domain orelse auth_domain;
+            if (from_org.len == 0 or auth_org.len == 0) break :blk false;
+            break :blk eqlIgnoreCase(from_org, auth_org);
         },
     };
-}
-
-/// Extract the organizational domain from a fully-qualified domain.
-///
-/// Simple heuristic: the organizational domain is the registered domain
-/// (effective TLD + 1 label). Without a full Public Suffix List, we use
-/// a simple two-label extraction (last two labels separated by dot).
-///
-/// For domains like "co.uk", "com.au", etc., this heuristic may be wrong.
-/// A full PSL implementation is deferred to a future enhancement.
-///
-/// Examples:
-///   "mail.example.com" → "example.com"
-///   "sub.host.example.com" → "example.com"
-///   "example.com" → "example.com"
-///   "localhost" → "localhost"
-pub fn getOrganizationalDomain(domain: []const u8) []const u8 {
-    // Find the rightmost dot
-    const last_dot = mem.lastIndexOfScalar(u8, domain, '.') orelse return domain;
-    if (last_dot == 0) return domain;
-
-    // Find the second-to-last dot
-    const prefix = domain[0..last_dot];
-    const second_dot = mem.lastIndexOfScalar(u8, prefix, '.') orelse return domain;
-
-    // Return everything after the second-to-last dot
-    return domain[second_dot + 1 ..];
 }
 
 /// Extract the domain part from an email address (everything after @).
@@ -90,27 +89,50 @@ fn toLower(c: u8) u8 {
 // Tests
 // =============================================================================
 
+fn ident(domain: []const u8, org: []const u8) Identifier {
+    return .{ .domain = domain, .org_domain = org, .result = "pass" };
+}
+
 test "strict alignment exact match" {
-    try std.testing.expect(isAligned("example.com", "example.com", .strict));
-    try std.testing.expect(isAligned("Example.COM", "example.com", .strict));
-    try std.testing.expect(!isAligned("mail.example.com", "example.com", .strict));
-    try std.testing.expect(!isAligned("example.com", "mail.example.com", .strict));
+    try std.testing.expect(isAligned("example.com", "example.com", ident("example.com", "example.com"), .strict));
+    try std.testing.expect(isAligned("Example.COM", "example.com", ident("example.com", "example.com"), .strict));
+    try std.testing.expect(!isAligned("mail.example.com", "example.com", ident("example.com", "example.com"), .strict));
+    try std.testing.expect(!isAligned("example.com", "example.com", ident("mail.example.com", "example.com"), .strict));
 }
 
-test "relaxed alignment organizational domain" {
-    try std.testing.expect(isAligned("example.com", "example.com", .relaxed));
-    try std.testing.expect(isAligned("mail.example.com", "example.com", .relaxed));
-    try std.testing.expect(isAligned("example.com", "mail.example.com", .relaxed));
-    try std.testing.expect(isAligned("sub.host.example.com", "mx.example.com", .relaxed));
-    try std.testing.expect(!isAligned("example.com", "example.org", .relaxed));
-    try std.testing.expect(!isAligned("notexample.com", "example.com", .relaxed));
+test "relaxed alignment compares organizational domains" {
+    try std.testing.expect(isAligned("mail.example.com", "example.com", ident("example.com", "example.com"), .relaxed));
+    try std.testing.expect(isAligned("example.com", "example.com", ident("mx.example.com", "example.com"), .relaxed));
+    try std.testing.expect(!isAligned("example.com", "example.com", ident("example.org", "example.org"), .relaxed));
 }
 
-test "organizational domain extraction" {
-    try std.testing.expectEqualStrings("example.com", getOrganizationalDomain("mail.example.com"));
-    try std.testing.expectEqualStrings("example.com", getOrganizationalDomain("sub.host.example.com"));
-    try std.testing.expectEqualStrings("example.com", getOrganizationalDomain("example.com"));
-    try std.testing.expectEqualStrings("localhost", getOrganizationalDomain("localhost"));
+test "relaxed alignment does not collapse public suffixes" {
+    // The M-2 bypass: under the old last-two-labels rule both sides reduced to
+    // "co.uk". With tree-walk organizational domains they stay distinct.
+    try std.testing.expect(!isAligned(
+        "a.victim.co.uk",
+        "victim.co.uk",
+        ident("attacker.co.uk", "attacker.co.uk"),
+        .relaxed,
+    ));
+}
+
+test "an identifier without an org domain falls back to itself" {
+    const no_org = Identifier{ .domain = "example.com", .result = "pass" };
+    try std.testing.expect(isAligned("mail.example.com", "example.com", no_org, .relaxed));
+    try std.testing.expect(!isAligned("mail.example.com", "mail.example.com", no_org, .relaxed));
+}
+
+test "a missing identifier never aligns" {
+    try std.testing.expect(!isAligned("example.com", "example.com", .{}, .relaxed));
+    try std.testing.expect(!isAligned("example.com", "example.com", .{}, .strict));
+}
+
+test "identifier passed" {
+    try std.testing.expect((Identifier{ .result = "pass" }).passed());
+    try std.testing.expect((Identifier{ .result = "PASS" }).passed());
+    try std.testing.expect(!(Identifier{ .result = "fail" }).passed());
+    try std.testing.expect(!(Identifier{}).passed());
 }
 
 test "get domain from email" {

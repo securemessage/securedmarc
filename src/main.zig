@@ -21,6 +21,8 @@ const header_scrub = securemilter.header_scrub;
 
 pub const dmarc = @import("dmarc.zig");
 pub const alignment = @import("alignment.zig");
+pub const treewalk = @import("treewalk.zig");
+pub const psl = @import("psl.zig");
 
 /// SecureDMARC runtime configuration parsed from INI config.
 pub const DmarcConfig = struct {
@@ -38,6 +40,7 @@ pub const DmarcConfig = struct {
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
     strip_auth_results: bool,
+    public_suffix_list: ?[]const u8,
 };
 
 const reload_mod = securemilter.reload;
@@ -50,15 +53,30 @@ var g_zmq_topic: []const u8 = "dmarc.evaluation";
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dmarc"} };
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 var g_config_gen: reload_mod.ConfigGeneration = reload_mod.ConfigGeneration.init();
+var g_allocator: Allocator = undefined;
+var g_psl: ?psl.PublicSuffixList = null;
 
 // Thread-local ZMQ publisher (one socket per worker thread — ZMQ thread-safety)
 threadlocal var tl_publisher: ?zmq.Publisher = null;
+
+// Thread-local DNS resolver. The tree walk issues up to eight lookups per
+// identity, and most of those names repeat across messages, so the resolver —
+// and with it its TTL cache — has to outlive a single message. One per worker
+// thread keeps it lock-free, matching the publisher and logger.
+threadlocal var tl_resolver: ?dns_mod.Resolver = null;
 
 fn getPublisher() *zmq.Publisher {
     if (tl_publisher == null) {
         tl_publisher = zmq.Publisher.init(g_zmq_endpoint, g_zmq_topic);
     }
     return &tl_publisher.?;
+}
+
+fn getResolver() *dns_mod.Resolver {
+    if (tl_resolver == null) {
+        tl_resolver = dns_mod.Resolver.initWithMonitor(g_allocator, g_dns_config, g_health_monitor);
+    }
+    return &tl_resolver.?;
 }
 
 /// Parse the SecureDMARC config from a loaded Config.
@@ -110,6 +128,9 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     // daemon precedes this one.
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
+    // Optional Public Suffix List, used only to veto a tree-walk result.
+    const public_suffix_list = global.get("PublicSuffixList");
+
     return .{
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
@@ -125,6 +146,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
         .strip_auth_results = strip_auth_results,
+        .public_suffix_list = public_suffix_list,
     };
 }
 
@@ -137,6 +159,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    g_allocator = allocator;
 
     // Parse command-line: securedmarc -c /path/to/config
     var args = std.process.args();
@@ -174,6 +197,19 @@ pub fn main() !void {
     g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
     g_zmq_topic = dmarc_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dmarc"}, .strip_all = dmarc_cfg.strip_auth_results };
+
+    // The tree walk decides the organizational boundary; the list, if present,
+    // may only reject a boundary that is demonstrably a public suffix.
+    if (dmarc_cfg.public_suffix_list) |path| {
+        var list = psl.PublicSuffixList.init(allocator);
+        if (list.loadFile(path)) {
+            log.info("loaded {d} public suffix rules from {s}", .{ list.count(), path });
+            g_psl = list;
+        } else |err| {
+            list.deinit();
+            log.err("failed to load PublicSuffixList {s}: {} — continuing on the DNS tree walk alone", .{ path, err });
+        }
+    }
 
     // Daemonize — MUST happen before spawning any threads (fork only preserves calling thread)
     if (!dmarc_cfg.foreground) {
@@ -368,48 +404,45 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     // (simplified: look for header.d= in A-R header text)
     dkim_domain = extractDkimDomain(conn);
 
-    // Step 3: DNS lookup _dmarc.<from_domain>
-    const dmarc_domain = std.fmt.allocPrint(conn.allocator, "_dmarc.{s}", .{from_domain}) catch {
+    // Step 3: Policy discovery and Organizational Domain, both by DNS tree
+    // walk (RFC 9989 §4.10). The walk starts at the Author Domain: if it
+    // publishes a record that is the policy, and the walk continues upward
+    // only to establish where the organizational boundary lies.
+    const resolver = getResolver();
+
+    var author_walk = treewalk.walk(conn.allocator, resolver, from_domain) catch {
         addArHeaderSimple(conn, "temperror", "internal error");
         return @intFromEnum(responses.Code.@"continue");
     };
-    defer conn.allocator.free(dmarc_domain);
+    defer author_walk.deinit();
 
-    var resolver = dns_mod.Resolver.initWithMonitor(conn.allocator, g_dns_config, g_health_monitor);
-    defer resolver.deinit();
-
-    var dns_result = resolver.resolve(dmarc_domain, .TXT) catch {
-        addArHeaderSimple(conn, "temperror", "DNS lookup failed");
-        return @intFromEnum(responses.Code.@"continue");
-    };
-    defer dns_result.deinit();
-
-    // Step 4: Find and parse DMARC record among TXT results
-    var record: ?dmarc.DmarcRecord = null;
-    var txt_iter = dns_result.txtRecords();
-    while (txt_iter.next()) |txt| {
-        if (dmarc.parseRecord(txt)) |r| {
-            record = r;
-            break;
+    // §4.10.1: the Author Domain's own record wins; otherwise the record
+    // belonging to its Organizational or Public Suffix Domain applies.
+    const rec = author_walk.recordAtStart() orelse author_walk.policyRecord() orelse {
+        if (author_walk.transient_error) {
+            addArHeaderSimple(conn, "temperror", "DNS lookup failed");
+        } else {
+            addArHeaderSimple(conn, "none", "no DMARC record found");
         }
-    }
-
-    const rec = record orelse {
-        addArHeaderSimple(conn, "none", "no DMARC record found");
         return @intFromEnum(responses.Code.@"continue");
     };
+
+    const from_org = treewalk.organizationalDomain(&author_walk, pslPtr());
+    const is_subdomain = !eqlIgnoreCase(from_domain, from_org);
+
+    // Step 4: Resolve each authenticated identifier's own Organizational
+    // Domain. Only needed for relaxed mode and only for identifiers that
+    // actually passed — strict mode is a string comparison (§4.10.2).
+    var spf_ident = alignment.Identifier{ .domain = envelope_domain, .result = spf_result };
+    var dkim_ident = alignment.Identifier{ .domain = dkim_domain, .result = dkim_result };
+
+    var spf_walk = orgWalk(conn, resolver, rec.aspf, from_domain, from_org, &spf_ident);
+    defer if (spf_walk) |*w| w.deinit();
+    var dkim_walk = orgWalk(conn, resolver, rec.adkim, from_domain, from_org, &dkim_ident);
+    defer if (dkim_walk) |*w| w.deinit();
 
     // Step 5: Evaluate alignment
-    const is_subdomain = isSubdomainOfOrg(from_domain);
-    const result = dmarc.evaluate(
-        &rec,
-        from_domain,
-        spf_result,
-        envelope_domain,
-        dkim_result,
-        dkim_domain,
-        is_subdomain,
-    );
+    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, dkim_ident);
 
     // Step 6: Add Authentication-Results header
     const disposition = dmarc.getDisposition(&rec, is_subdomain);
@@ -433,6 +466,41 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+/// Establish an authenticated identifier's Organizational Domain, if that is
+/// what alignment will actually compare.
+///
+/// Returns the walk so the caller can keep it alive: `ident.org_domain` points
+/// into it. Null when no walk was needed — strict alignment compares domains
+/// directly, an identifier that did not pass cannot align anyway, and an
+/// identifier equal to the Author Domain already shares its boundary
+/// (RFC 9989 §4.10.2).
+fn orgWalk(
+    conn: *connection_mod.Connection,
+    resolver: *dns_mod.Resolver,
+    mode: alignment.AlignmentMode,
+    from_domain: []const u8,
+    from_org: []const u8,
+    ident: *alignment.Identifier,
+) ?treewalk.Walk {
+    if (mode != .relaxed) return null;
+    if (!ident.passed()) return null;
+    const domain = ident.domain orelse return null;
+
+    if (eqlIgnoreCase(domain, from_domain)) {
+        ident.org_domain = from_org;
+        return null;
+    }
+
+    var w = treewalk.walk(conn.allocator, resolver, domain) catch return null;
+    ident.org_domain = treewalk.organizationalDomain(&w, pslPtr());
+    return w;
+}
+
+fn pslPtr() ?*const psl.PublicSuffixList {
+    if (g_psl) |*list| return list;
+    return null;
+}
 
 fn countFromHeaders(conn: *connection_mod.Connection) usize {
     var count: usize = 0;
@@ -481,11 +549,6 @@ fn extractDkimDomain(conn: *connection_mod.Connection) ?[]const u8 {
         }
     }
     return null;
-}
-
-fn isSubdomainOfOrg(domain: []const u8) bool {
-    const org = alignment.getOrganizationalDomain(domain);
-    return !eqlIgnoreCase(domain, org);
 }
 
 fn publishEvent(
@@ -581,15 +644,20 @@ fn toLower(c: u8) u8 {
 // Reload
 // =============================================================================
 
-/// Main-thread reload callback. SecureDMARC has no file-based reloadable
-/// state (it reads DMARC records from DNS per-message). This is a no-op
-/// that still increments the generation for interface consistency.
+/// Main-thread reload callback. SecureDMARC reads DMARC records from DNS per
+/// message, so the only reloadable state is the optional public suffix list.
 fn reloadConfig() void {
     g_config_gen.increment();
     log.info("SIGHUP: config generation advanced to {d}", .{g_config_gen.load()});
 }
 
 fn onWorkerReload() void {
+    // Drop the cached resolver so a reload picks up new nameservers and starts
+    // from a clean cache rather than serving answers from the old config.
+    if (tl_resolver) |*r| {
+        r.deinit();
+        tl_resolver = null;
+    }
     log.debug("worker: config reload acknowledged", .{});
 }
 
@@ -600,6 +668,8 @@ fn onWorkerReload() void {
 test {
     _ = dmarc;
     _ = alignment;
+    _ = treewalk;
+    _ = psl;
 }
 
 test "parse config minimal" {
