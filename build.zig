@@ -46,4 +46,31 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Public suffix list benchmark. Always ReleaseSafe, whatever -Doptimize
+    // says: the numbers are only meaningful if they measure the build the
+    // daemon actually ships. psl.zig depends on nothing but std, so it can be
+    // imported on its own rather than dragging in the whole daemon.
+    const psl_mod = b.createModule(.{
+        .root_source_file = b.path("src/psl.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+
+    const bench = b.addExecutable(.{
+        .name = "psl-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/psl_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "psl", .module = psl_mod },
+            },
+        }),
+    });
+
+    const run_bench = b.addRunArtifact(bench);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Benchmark public suffix list load and lookup");
+    bench_step.dependOn(&run_bench.step);
 }

@@ -45,7 +45,9 @@ pub const Result = enum {
     }
 };
 
-/// Value of the psd= tag (RFC 9989 §4.10.2).
+/// Value of the psd= tag, defined in RFC 9989 §4.7 and consumed by the tree
+/// walk in §4.10 (it stops the walk) and §4.10.2 (it selects the
+/// Organizational Domain).
 pub const Psd = enum {
     /// psd=y — this domain is a Public Suffix Domain; the Organizational
     /// Domain is one label below it.
