@@ -163,7 +163,21 @@ fn lookup(allocator: Allocator, resolver: *dns_mod.Resolver, domain: []const u8)
     const qname = std.fmt.allocPrint(allocator, "_dmarc.{s}", .{domain}) catch return .transient;
     defer allocator.free(qname);
 
-    var res = resolver.resolve(qname, .TXT) catch return .transient;
+    var res = resolver.resolve(qname, .TXT) catch |err| {
+        // An authoritative "no such name" is not a failure here, it is the
+        // answer: almost every step of a tree walk asks about a `_dmarc` name
+        // that does not exist. Reporting it as transient latched
+        // `transient_error` on the walk, and since the flag is only consulted
+        // when nothing was found anywhere, the visible effect was
+        // `dmarc=temperror` for every domain that publishes no DMARC record —
+        // which is most of them.
+        //
+        // The resolver could not express the difference until NegativeKind
+        // existed; `transient_error` has always been documented as meaning
+        // "failed in a way that is not 'no such record'".
+        if (dns_mod.isTransientError(err)) return .transient;
+        return .absent;
+    };
     defer res.deinit();
 
     // §4.10 steps 2 and 6: more than one valid record at a name is
