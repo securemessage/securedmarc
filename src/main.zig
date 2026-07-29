@@ -454,7 +454,7 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 
     // §4.10.1: the Author Domain's own record wins; otherwise the record
     // belonging to its Organizational or Public Suffix Domain applies.
-    const rec = author_walk.recordAtStart() orelse author_walk.policyRecord() orelse {
+    const selected = author_walk.recordAtStart() orelse author_walk.policyRecord() orelse {
         if (author_walk.transient_error) {
             addArHeaderSimple(conn, "temperror", "DNS lookup failed") catch |err|
                 return auth_stamp.deferCode(err, "dmarc");
@@ -464,6 +464,31 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
         }
         return @intFromEnum(responses.Code.@"continue");
     };
+
+    // §4.10.1: a record whose p= is missing or invalid, or which carries an
+    // invalid sp= or np=, is not simply ignored. A valid rua= makes it act as
+    // p=none; without one, DMARC does not apply to this message at all.
+    //
+    // The second branch is why this is a decision and not a default: reporting
+    // `none` here is the RFC's answer, whereas falling through to a parent's
+    // record -- what returning null from parseRecord used to cause -- could
+    // apply an organizational `p=reject` to a domain the RFC says to leave
+    // alone, and reject mail on the strength of a malformed record.
+    var rec = selected;
+    switch (rec.applicability()) {
+        .apply => {},
+        .as_none => {
+            rec.policy = .none;
+            rec.subdomain_policy = null;
+            log.info("dmarc: {s}: record has no usable policy but a valid rua=, applying p=none per RFC 9989 4.10.1", .{from_domain});
+        },
+        .no_processing => {
+            log.info("dmarc: {s}: record has no usable policy and no valid rua=, no DMARC processing per RFC 9989 4.10.1", .{from_domain});
+            addArHeaderSimple(conn, "none", "record has no usable policy") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
+            return @intFromEnum(responses.Code.@"continue");
+        },
+    }
 
     const from_org = treewalk.organizationalDomain(&author_walk, pslPtr());
     const is_subdomain = !eqlIgnoreCase(from_domain, from_org);
@@ -714,6 +739,7 @@ fn onWorkerReload() void {
 
 test {
     _ = dmarc;
+    _ = @import("dmarc_test.zig");
     _ = alignment;
     _ = treewalk;
     _ = psl;

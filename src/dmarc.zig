@@ -45,6 +45,23 @@ pub const Result = enum {
     }
 };
 
+/// Value of the t= tag, RFC 9989 §4.7. Whether the Domain Owner wants the
+/// policy in p=/sp=/np= actually applied, or is still testing it.
+pub const TestMode = enum {
+    /// t=n or absent — apply the declared policy.
+    apply,
+    /// t=y — the Domain Owner is testing, and expects one level below the
+    /// declared policy to be applied to failing messages.
+    testing,
+
+    pub fn fromString(s: []const u8) TestMode {
+        // §4.8: a syntax error in the remainder of the record is discarded in
+        // favour of the default, so anything that is not "y" reads as t=n.
+        if (eqlIgnoreCase(s, "y")) return .testing;
+        return .apply;
+    }
+};
+
 /// Value of the psd= tag, defined in RFC 9989 §4.7 and consumed by the tree
 /// walk in §4.10 (it stops the walk) and §4.10.2 (it selects the
 /// Organizational Domain).
@@ -74,8 +91,8 @@ pub const DmarcRecord = struct {
     adkim: alignment.AlignmentMode = .relaxed,
     /// SPF alignment mode (aspf=). Default: relaxed.
     aspf: alignment.AlignmentMode = .relaxed,
-    /// Percentage of messages to apply policy (pct=). Default: 100.
-    pct: u8 = 100,
+    /// Test mode (t=), RFC 9989 §4.7. Default: apply the policy as declared.
+    testing: TestMode = .apply,
     /// Aggregate report URI (rua=). Informational only for milter.
     rua: ?[]const u8 = null,
     /// Forensic report URI (ruf=). Informational only for milter.
@@ -87,24 +104,118 @@ pub const DmarcRecord = struct {
     /// "unknown", which leaves the boundary for the DNS tree walk to work out.
     psd: Psd = .unknown,
 
+    /// Policy for non-existent subdomains (np=), RFC 9989 §4.7.
+    ///
+    /// Parsed so §4.10.1 can tell a *valid* np= from an invalid one, which is
+    /// one of the three triggers for the applicability rule. **Not yet applied:**
+    /// choosing np= over sp= requires a DNS existence check on the Author
+    /// Domain that the daemon does not currently make, so a domain publishing
+    /// `sp=none; np=reject` still gets sp= treatment. Tracked as post-V1.
+    np: ?Policy = null,
+
+    /// A valid `p=` tag was present. §4.10.1 turns on this and the two flags
+    /// below, so they are recorded at parse time rather than re-derived.
+    policy_valid: bool = false,
+
+    /// An `sp=` or `np=` tag was present but its value was not a policy.
+    /// §4.10.1 treats that exactly like a missing `p=`.
+    subdomain_tag_invalid: bool = false,
+
+    /// `rua=` was present and held at least one syntactically valid URI.
+    rua_valid: bool = false,
+
     /// Get the effective subdomain policy.
     pub fn getSubdomainPolicy(self: *const DmarcRecord) Policy {
         return self.subdomain_policy orelse self.policy;
     }
+
+    /// RFC 9989 §4.10.1, applied to the record policy discovery selected.
+    pub fn applicability(self: *const DmarcRecord) Applicability {
+        if (self.policy_valid and !self.subdomain_tag_invalid) return .apply;
+        // "If a rua tag is present and contains at least one syntactically
+        // valid reporting URI, the Mail Receiver MUST act as if a record
+        // containing p=none was retrieved and continue processing."
+        if (self.rua_valid) return .as_none;
+        // "Otherwise, the Mail Receiver applies no DMARC processing to this
+        // message." Note this is *not* the same as continuing the tree walk:
+        // a retrieved-but-unusable record ends DMARC for the message rather
+        // than deferring to a parent's policy.
+        return .no_processing;
+    }
 };
+
+/// What RFC 9989 §4.10.1 says to do with the record policy discovery selected.
+pub const Applicability = enum {
+    /// The record carries a usable policy; apply it.
+    apply,
+    /// Unusable policy but a valid `rua=`: act as if `p=none` was published.
+    as_none,
+    /// Unusable policy and no valid `rua=`: apply no DMARC processing at all.
+    no_processing,
+};
+
+/// Does `rua=` hold at least one syntactically valid reporting URI?
+///
+/// §4.8: `dmarc-urilist` is a comma-separated list of `dmarc-uri`, which is a
+/// URI per RFC 3986, optionally carrying the obsolete `!size` suffix that
+/// §4.8 says to ignore. A URI needs a scheme -- ALPHA followed by ALPHA /
+/// DIGIT / "+" / "-" / "." -- then ":" and a non-empty remainder.
+///
+/// Scheme *support* is deliberately not considered. §4.6 says a receiver must
+/// ignore URIs whose schemes it does not support, but that governs whether a
+/// report is sent; §4.10.1 asks only whether a URI is syntactically valid. A
+/// record listing `https://` alone still counts here even though this daemon
+/// sends no reports at all, because the question is what policy to apply.
+pub fn hasValidReportingUri(rua: []const u8) bool {
+    var iter = mem.splitScalar(u8, rua, ',');
+    while (iter.next()) |raw| {
+        var uri = mem.trim(u8, raw, &std.ascii.whitespace);
+        // Strip the obsolete size limit: dmarc-uri "!" 1*DIGIT [k/m/g/t].
+        if (mem.indexOfScalar(u8, uri, '!')) |bang| uri = uri[0..bang];
+        const colon = mem.indexOfScalar(u8, uri, ':') orelse continue;
+        if (colon == 0) continue;
+        if (colon + 1 >= uri.len) continue;
+        if (!std.ascii.isAlphabetic(uri[0])) continue;
+        var scheme_ok = true;
+        for (uri[1..colon]) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.') continue;
+            scheme_ok = false;
+            break;
+        }
+        if (scheme_ok) return true;
+    }
+    return false;
+}
 
 /// Parse a DMARC TXT record value.
 ///
-/// RFC 7489 §6.3: record starts with "v=DMARC1" (case-insensitive),
-/// followed by semicolon-separated tag=value pairs.
+/// Returns null only when the text is **not a DMARC Policy Record at all** --
+/// that is, when `v=` is absent, not first, or not exactly `DMARC1` (§4.7,
+/// §4.8). A record whose `v=` is good but whose `p=` is missing or invalid
+/// still parses, because §4.10.1 gives those records defined behaviour that
+/// depends on `rua=` and cannot be expressed by returning null.
 ///
-/// Returns null if the record is not a valid DMARC record.
+/// This distinction matters to the tree walk: null means "nothing here, keep
+/// walking", whereas a record with an unusable policy may end DMARC processing
+/// for the message outright. Returning null for a missing `p=` conflated the
+/// two and silently applied a *parent's* policy to a domain the RFC says to
+/// treat as `p=none`.
 pub fn parseRecord(txt: []const u8) ?DmarcRecord {
     const trimmed = mem.trim(u8, txt, &std.ascii.whitespace);
     if (trimmed.len < 8) return null;
 
-    // Must start with v=DMARC1
-    if (!startsWithIgnoreCase(trimmed, "v=DMARC1")) return null;
+    // §4.8: dmarc-version = "v" equals %s"DMARC1". The %s prefix (RFC 7405)
+    // makes the *value* case sensitive while the tag name, like every other
+    // tag name, is not. §4.7 states the same thing in prose and adds that a
+    // record whose v= is absent, not first, or not exactly "DMARC1" MUST be
+    // ignored entirely.
+    //
+    // So "V=DMARC1" is a valid record and "v=dmarc1" is not one at all. Both
+    // used to parse, which meant a malformed record was read as policy.
+    if (trimmed.len < 2) return null;
+    if (toLower(trimmed[0]) != 'v') return null;
+    if (trimmed[1] != '=') return null;
+    if (!mem.startsWith(u8, trimmed[2..], "DMARC1")) return null;
     // After v=DMARC1, must be end of string, semicolon, or whitespace
     if (trimmed.len > 8) {
         const next = trimmed[8];
@@ -131,15 +242,27 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
             record.policy = Policy.fromString(val) orelse continue;
             found_policy = true;
         } else if (eqlIgnoreCase(tag, "sp")) {
-            record.subdomain_policy = Policy.fromString(val);
+            // An *absent* sp= defaults to p=; an sp= with an unparseable value
+            // is a §4.10.1 trigger. Leaving subdomain_policy null for both
+            // would silently downgrade the second case to the first.
+            record.subdomain_policy = Policy.fromString(val) orelse {
+                record.subdomain_tag_invalid = true;
+                continue;
+            };
+        } else if (eqlIgnoreCase(tag, "np")) {
+            record.np = Policy.fromString(val) orelse {
+                record.subdomain_tag_invalid = true;
+                continue;
+            };
         } else if (eqlIgnoreCase(tag, "adkim")) {
             record.adkim = parseAlignmentTag(val);
         } else if (eqlIgnoreCase(tag, "aspf")) {
             record.aspf = parseAlignmentTag(val);
-        } else if (eqlIgnoreCase(tag, "pct")) {
-            record.pct = std.fmt.parseInt(u8, val, 10) catch 100;
+        } else if (eqlIgnoreCase(tag, "t")) {
+            record.testing = TestMode.fromString(val);
         } else if (eqlIgnoreCase(tag, "rua")) {
             record.rua = val;
+            record.rua_valid = hasValidReportingUri(val);
         } else if (eqlIgnoreCase(tag, "ruf")) {
             record.ruf = val;
         } else if (eqlIgnoreCase(tag, "fo")) {
@@ -149,8 +272,10 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
         }
     }
 
-    // p= tag is REQUIRED (RFC 7489 §6.3)
-    if (!found_policy) return null;
+    // p= is REQUIRED, but a record missing it is not thereby "not a DMARC
+    // record": §4.10.1 defines what to do with it. The caller decides via
+    // applicability(); see the doc comment above.
+    record.policy_valid = found_policy;
 
     return record;
 }
@@ -184,11 +309,35 @@ pub fn evaluate(
 
 /// Get the disposition action string for an A-R header reason comment.
 pub fn getDisposition(record: *const DmarcRecord, is_subdomain: bool) []const u8 {
-    const effective = if (is_subdomain)
+    return effectivePolicy(record, is_subdomain).toString();
+}
+
+/// The policy this hop should actually act on, after RFC 9989 §4.7 test mode.
+///
+/// `t=y` is **not** "treat as none". §4.7 asks for the policy one level below
+/// the declared one -- `reject` becomes `quarantine`, `quarantine` becomes
+/// `none` -- and says the tag "has no effect on any policy that is none". A
+/// naive mapping of `t=y` to `none` would let a domain testing `p=reject`
+/// through unquarantined, which is a larger downgrade than it asked for.
+///
+/// Test mode deliberately does not affect the DMARC *result*, only the
+/// disposition: §4.7 states it does not affect report generation, and the
+/// `dmarc=` value in `Authentication-Results` is what a downstream consumer
+/// and any future reporter read.
+pub fn effectivePolicy(record: *const DmarcRecord, is_subdomain: bool) Policy {
+    const declared = if (is_subdomain)
         record.getSubdomainPolicy()
     else
         record.policy;
-    return effective.toString();
+
+    return switch (record.testing) {
+        .apply => declared,
+        .testing => switch (declared) {
+            .reject => .quarantine,
+            .quarantine => .none,
+            .none => .none,
+        },
+    };
 }
 
 fn parseAlignmentTag(val: []const u8) alignment.AlignmentMode {
@@ -216,121 +365,3 @@ fn toLower(c: u8) u8 {
     return c;
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
-test "parse minimal DMARC record" {
-    const r = parseRecord("v=DMARC1; p=none") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Policy.none, r.policy);
-    try std.testing.expectEqual(alignment.AlignmentMode.relaxed, r.adkim);
-    try std.testing.expectEqual(alignment.AlignmentMode.relaxed, r.aspf);
-    try std.testing.expectEqual(@as(u8, 100), r.pct);
-}
-
-test "parse psd tag" {
-    const y = parseRecord("v=DMARC1; p=reject; psd=y") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Psd.yes, y.psd);
-
-    const n = parseRecord("v=DMARC1; p=none; psd=n") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Psd.no, n.psd);
-
-    // psd=u and an absent tag both leave the boundary undeclared.
-    const u = parseRecord("v=DMARC1; p=none; psd=u") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Psd.unknown, u.psd);
-    const absent = parseRecord("v=DMARC1; p=none") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Psd.unknown, absent.psd);
-}
-
-test "parse full DMARC record" {
-    const r = parseRecord("v=DMARC1; p=reject; sp=quarantine; adkim=s; aspf=s; pct=50; rua=mailto:dmarc@example.com") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Policy.reject, r.policy);
-    try std.testing.expectEqual(Policy.quarantine, r.subdomain_policy.?);
-    try std.testing.expectEqual(alignment.AlignmentMode.strict, r.adkim);
-    try std.testing.expectEqual(alignment.AlignmentMode.strict, r.aspf);
-    try std.testing.expectEqual(@as(u8, 50), r.pct);
-    try std.testing.expectEqualStrings("mailto:dmarc@example.com", r.rua.?);
-}
-
-test "parse case insensitive" {
-    const r = parseRecord("V=DMARC1; P=Reject; ADKIM=S") orelse return error.ParseFailed;
-    try std.testing.expectEqual(Policy.reject, r.policy);
-    try std.testing.expectEqual(alignment.AlignmentMode.strict, r.adkim);
-}
-
-test "reject invalid records" {
-    try std.testing.expect(parseRecord("v=spf1 include:example.com -all") == null);
-    try std.testing.expect(parseRecord("v=DMARC1") == null); // no p= tag
-    try std.testing.expect(parseRecord("") == null);
-    try std.testing.expect(parseRecord("v=DMARC2; p=none") == null);
-}
-
-test "evaluate pass with SPF aligned" {
-    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
-    const spf = alignment.Identifier{
-        .domain = "mail.example.com",
-        .org_domain = "example.com",
-        .result = "pass",
-    };
-    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, .{}));
-}
-
-test "evaluate pass with DKIM aligned" {
-    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
-    const spf = alignment.Identifier{
-        .domain = "other.com",
-        .org_domain = "other.com",
-        .result = "fail",
-    };
-    const dkim = alignment.Identifier{
-        .domain = "example.com",
-        .org_domain = "example.com",
-        .result = "pass",
-    };
-    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, dkim));
-}
-
-test "evaluate fail neither aligned" {
-    const record = DmarcRecord{ .policy = .reject, .aspf = .strict, .adkim = .strict };
-    const spf = alignment.Identifier{ .domain = "other.com", .result = "pass" };
-    const dkim = alignment.Identifier{ .domain = "different.com", .result = "pass" };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, dkim));
-}
-
-test "evaluate fail SPF pass but not aligned strict" {
-    const record = DmarcRecord{ .policy = .quarantine, .aspf = .strict };
-    const spf = alignment.Identifier{
-        .domain = "mail.example.com",
-        .org_domain = "example.com",
-        .result = "pass",
-    };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, .{}));
-}
-
-test "evaluate fail when public suffixes no longer collapse" {
-    // M-2: the SPF identity really did pass, but the two registrants under
-    // co.uk have distinct organizational domains, so relaxed alignment fails.
-    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
-    const spf = alignment.Identifier{
-        .domain = "attacker.co.uk",
-        .org_domain = "attacker.co.uk",
-        .result = "pass",
-    };
-    try std.testing.expectEqual(
-        Result.fail,
-        evaluate(&record, "a.victim.co.uk", "victim.co.uk", spf, .{}),
-    );
-}
-
-test "evaluate fail when no identifier authenticated" {
-    const record = DmarcRecord{ .policy = .reject };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", .{}, .{}));
-}
-
-test "subdomain policy" {
-    const record = DmarcRecord{ .policy = .reject, .subdomain_policy = .none };
-    try std.testing.expectEqual(Policy.none, record.getSubdomainPolicy());
-
-    const record2 = DmarcRecord{ .policy = .reject };
-    try std.testing.expectEqual(Policy.reject, record2.getSubdomainPolicy());
-}

@@ -5,4 +5,15 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-781 src/main.zig
+# src/main.zig — raised from 781 for the RFC 9989 4.10.1 applicability switch.
+#   R1 has not been done for this daemon yet; when it is, the doDmarcEvaluation
+#   flow moves out the way securearc's did and this drops sharply.
+# src/treewalk.zig — newly over goal. Roughly 175 of these lines are tests,
+#   which the gate would exclude if they lived in treewalk_test.zig. They do
+#   not, because they exercise countLabels, nextTarget, oneLabelBelow and
+#   RecordSelector, all of which are private. Extracting them means making
+#   internals public purely to test them, which is a worse trade than 33 lines
+#   over the goal. dmarc.zig's tests *were* extracted, because every symbol
+#   they touch was already public.
+807 src/main.zig
+433 src/treewalk.zig

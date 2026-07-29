@@ -180,20 +180,38 @@ fn lookup(allocator: Allocator, resolver: *dns_mod.Resolver, domain: []const u8)
     };
     defer res.deinit();
 
-    // §4.10 steps 2 and 6: more than one valid record at a name is
-    // unresolvable ambiguity, so all of them are discarded.
-    var record: ?dmarc.DmarcRecord = null;
-    var count: usize = 0;
+    var selector = RecordSelector{};
     var iter = res.txtRecords();
-    while (iter.next()) |txt| {
-        if (dmarc.parseRecord(txt)) |r| {
-            record = r;
-            count += 1;
-        }
-    }
-    if (count != 1) return .absent;
-    return .{ .found = record.? };
+    while (iter.next()) |txt| selector.offer(txt);
+    return .{ .found = selector.selected() orelse return .absent };
 }
+
+/// RFC 9989 §4.10 steps 2 and 6: exactly one DMARC Policy Record may exist at a
+/// name. More than one is unresolvable ambiguity and *all* of them are
+/// discarded, rather than one being picked.
+///
+/// A named type rather than two locals because "a record" here means precisely
+/// "text with a current `v=DMARC1`" — including a record whose `p=` is missing
+/// or invalid, which §4.10.1 handles separately and which therefore still
+/// counts towards the ambiguity test. While `parseRecord` returned null for a
+/// missing `p=`, a name publishing `v=DMARC1; rua=...` alongside
+/// `v=DMARC1; p=reject` counted one record and applied the `p=reject`, silently
+/// resolving an ambiguity the RFC says to refuse.
+const RecordSelector = struct {
+    record: ?dmarc.DmarcRecord = null,
+    count: usize = 0,
+
+    fn offer(self: *RecordSelector, txt: []const u8) void {
+        const parsed = dmarc.parseRecord(txt) orelse return;
+        self.record = parsed;
+        self.count += 1;
+    }
+
+    fn selected(self: *const RecordSelector) ?dmarc.DmarcRecord {
+        if (self.count != 1) return null;
+        return self.record;
+    }
+};
 
 /// The next name to query, per §4.10 steps 3, 4 and 7.
 fn nextTarget(target: []const u8) ?[]const u8 {
@@ -255,6 +273,54 @@ fn testWalk(allocator: Allocator, start: []const u8, entries: []const struct { [
         try w.found.append(allocator, .{ .domain = name, .record = e[1], .labels = countLabels(name) });
     }
     return w;
+}
+
+test "4.10 step 2: exactly one record at a name, or none" {
+    const one = blk: {
+        var s = RecordSelector{};
+        s.offer("v=DMARC1; p=reject");
+        break :blk s;
+    };
+    try std.testing.expectEqual(dmarc.Policy.reject, one.selected().?.policy);
+
+    // Nothing that is a DMARC record at all.
+    const none = blk: {
+        var s = RecordSelector{};
+        s.offer("v=spf1 -all");
+        s.offer("some unrelated TXT record");
+        break :blk s;
+    };
+    try std.testing.expect(none.selected() == null);
+
+    // Two records: ambiguous, so *neither* is used.
+    const two = blk: {
+        var s = RecordSelector{};
+        s.offer("v=DMARC1; p=reject");
+        s.offer("v=DMARC1; p=none");
+        break :blk s;
+    };
+    try std.testing.expect(two.selected() == null);
+
+    // The case the parseRecord contract change made reachable: a record with no
+    // usable p= still counts, so this name is ambiguous rather than resolving
+    // to the p=reject. Non-DMARC TXT records alongside it are still ignored.
+    const ambiguous_via_unusable = blk: {
+        var s = RecordSelector{};
+        s.offer("v=DMARC1; rua=mailto:d@example.com");
+        s.offer("v=DMARC1; p=reject");
+        s.offer("v=spf1 -all");
+        break :blk s;
+    };
+    try std.testing.expect(ambiguous_via_unusable.selected() == null);
+
+    // And on its own it is the one record at that name.
+    const unusable_alone = blk: {
+        var s = RecordSelector{};
+        s.offer("v=DMARC1; rua=mailto:d@example.com");
+        break :blk s;
+    };
+    const rec = unusable_alone.selected() orelse return error.ExpectedRecord;
+    try std.testing.expectEqual(dmarc.Applicability.as_none, rec.applicability());
 }
 
 test "count labels" {
