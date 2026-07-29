@@ -499,9 +499,9 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     var spf_ident = alignment.Identifier{ .domain = envelope_domain, .result = spf_result };
     var dkim_ident = alignment.Identifier{ .domain = dkim_domain, .result = dkim_result };
 
-    var spf_walk = orgWalk(conn, resolver, rec.aspf, from_domain, from_org, &spf_ident);
+    var spf_walk = treewalk.orgWalk(conn.allocator, resolver, rec.aspf, from_domain, from_org, &spf_ident, pslPtr());
     defer if (spf_walk) |*w| w.deinit();
-    var dkim_walk = orgWalk(conn, resolver, rec.adkim, from_domain, from_org, &dkim_ident);
+    var dkim_walk = treewalk.orgWalk(conn.allocator, resolver, rec.adkim, from_domain, from_org, &dkim_ident, pslPtr());
     defer if (dkim_walk) |*w| w.deinit();
 
     // Step 5: Evaluate alignment
@@ -530,36 +530,6 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 // =============================================================================
 // Helper functions
 // =============================================================================
-
-/// Establish an authenticated identifier's Organizational Domain, if that is
-/// what alignment will actually compare.
-///
-/// Returns the walk so the caller can keep it alive: `ident.org_domain` points
-/// into it. Null when no walk was needed — strict alignment compares domains
-/// directly, an identifier that did not pass cannot align anyway, and an
-/// identifier equal to the Author Domain already shares its boundary
-/// (RFC 9989 §4.10.2).
-fn orgWalk(
-    conn: *connection_mod.Connection,
-    resolver: *dns_mod.Resolver,
-    mode: alignment.AlignmentMode,
-    from_domain: []const u8,
-    from_org: []const u8,
-    ident: *alignment.Identifier,
-) ?treewalk.Walk {
-    if (mode != .relaxed) return null;
-    if (!ident.passed()) return null;
-    const domain = ident.domain orelse return null;
-
-    if (eqlIgnoreCase(domain, from_domain)) {
-        ident.org_domain = from_org;
-        return null;
-    }
-
-    var w = treewalk.walk(conn.allocator, resolver, domain) catch return null;
-    ident.org_domain = treewalk.organizationalDomain(&w, pslPtr());
-    return w;
-}
 
 fn pslPtr() ?*const psl.PublicSuffixList {
     if (g_psl) |*list| return list;

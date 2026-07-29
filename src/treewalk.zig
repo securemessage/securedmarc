@@ -8,6 +8,7 @@ const log = securemilter.log;
 
 const dmarc = @import("dmarc.zig");
 const psl_mod = @import("psl.zig");
+const alignment = @import("alignment.zig");
 
 /// RFC 9989 §4.10 DNS Tree Walk.
 ///
@@ -64,7 +65,55 @@ pub const Walk = struct {
         if (self.found.items.len == 0) return null;
         return self.found.items[self.found.items.len - 1].record;
     }
+
+    /// The name `policyRecord` took its record from -- the policy domain.
+    ///
+    /// Paired with `policyRecord` so the "which name won" rule lives in exactly
+    /// one place. `securedmarc-check` reports it, and a caller that wants to log
+    /// which domain's policy it applied can use it without reaching into `found`
+    /// and re-deriving the selection.
+    pub fn policyDomain(self: *const Walk) ?[]const u8 {
+        if (self.found.items.len == 0) return null;
+        return self.found.items[self.found.items.len - 1].domain;
+    }
 };
+
+/// Establish an authenticated identifier's Organizational Domain, if that is
+/// what alignment will actually compare.
+///
+/// Returns the walk so the caller can keep it alive: `ident.org_domain` points
+/// into it. Null when no walk was needed -- strict alignment compares domains
+/// directly, an identifier that did not pass cannot align anyway, and an
+/// identifier equal to the Author Domain already shares its boundary
+/// (RFC 9989 §4.10.2, "There is no need to perform Identifier Alignment
+/// Evaluations under any of the following conditions").
+///
+/// Lives here rather than in the milter because `securedmarc-check` needs the
+/// same three skip conditions. Two copies would let a conformance result speak
+/// about the checker's version of alignment instead of the shipped one, which is
+/// the failure mode the external-oracle gate exists to prevent.
+pub fn orgWalk(
+    allocator: Allocator,
+    resolver: *dns_mod.Resolver,
+    mode: alignment.AlignmentMode,
+    from_domain: []const u8,
+    from_org: []const u8,
+    ident: *alignment.Identifier,
+    psl: ?*const psl_mod.PublicSuffixList,
+) ?Walk {
+    if (mode != .relaxed) return null;
+    if (!ident.passed()) return null;
+    const domain = ident.domain orelse return null;
+
+    if (eqlIgnoreCase(domain, from_domain)) {
+        ident.org_domain = from_org;
+        return null;
+    }
+
+    var w = walk(allocator, resolver, domain) catch return null;
+    ident.org_domain = organizationalDomain(&w, psl);
+    return w;
+}
 
 /// Walk up from `domain`, collecting every name that publishes a valid DMARC
 /// policy record. Caller owns the returned Walk.
