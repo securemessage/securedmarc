@@ -719,59 +719,11 @@ test {
     _ = alignment;
     _ = treewalk;
     _ = psl;
-}
 
-// The implicit listener binds loopback, never 0.0.0.0.
-//
-// Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. This daemon decides
-// disposition, so a reachable port lets an attacker supply a message whose
-// Authentication-Results it will believe -- M-1/X-1 without forging a header -- and
-// under p=reject it decides what gets bounced. The milter protocol authenticates
-// nobody, so reachability IS authorization.
-test "the implicit listener binds loopback, not every interface" {
-    const ini_text =
-        \\[global]
-        \\AuthservID = mail.test.com
-    ;
-
-    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
-    defer cfg.deinit();
-
-    const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
-    defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
-    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
-
-    try std.testing.expectEqual(@as(usize, 1), dmarc_cfg.listen_addresses.len);
-    switch (dmarc_cfg.listen_addresses[0]) {
-        .tcp => |tcp| {
-            try std.testing.expectEqualStrings("127.0.0.1", tcp.host);
-            try std.testing.expectEqual(@as(u16, 8894), tcp.port);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-// A safe default, not a policy override. `parse config minimal` below binds
-// 0.0.0.0 explicitly and must keep working, so that case covers the operator who
-// genuinely needs a routable socket.
-test "parse config minimal" {
-    const ini_text =
-        \\[global]
-        \\AuthservID = mail.test.com
-        \\
-        \\[listener:inbound]
-        \\Socket = inet:8894@0.0.0.0
-    ;
-
-    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
-    defer cfg.deinit();
-
-    const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
-    defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
-    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
-
-    try std.testing.expectEqualStrings("mail.test.com", dmarc_cfg.authserv_id);
-    try std.testing.expectEqual(@as(usize, 1), dmarc_cfg.listen_addresses.len);
+    // An unreferenced @import is NOT analyzed, so its tests are silently absent
+    // and a test that never runs looks exactly like a test that passes. That is
+    // how msgfile.zig's three tests sat dormant in securearc (audit 11.29).
+    _ = @import("main_test.zig");
 }
 
 // X-9: both wrappers must stay fallible.

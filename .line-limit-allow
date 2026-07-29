@@ -1,7 +1,28 @@
+# WARNING: `zig build lint -- --update` REWRITES THIS FILE AND DELETES EVERY COMMENT.
+#   It erased the notes below once on 2026-07-29 and they had to be recovered from
+#   git. Re-add rationale by hand after any --update, or edit the numbers directly.
+#
 # 2026-07-29, X-13: the implicit listener now binds loopback instead of 0.0.0.0.
-#   main.zig 777 -> 816. One test plus the reasoning. This daemon decides disposition,
-#   so a reachable socket meant an attacker could supply the Authentication-Results it
-#   evaluates -- M-1/X-1 without forging a header in transit.
+#   This daemon decides disposition, so a reachable socket meant an attacker could
+#   supply the Authentication-Results it evaluates -- M-1/X-1 without forging a
+#   header in transit -- and under p=reject decide what gets bounced.
+#
+# 2026-07-29, test extraction DONE: main.zig 816 -> 768. The two listener tests
+#   moved to src/main_test.zig. parseDmarcConfig and DmarcConfig were already pub.
+#
+#   `parse config minimal` was STRENGTHENED while being moved: it asserted only that
+#   the config parsed and returned one listener, so it would still have passed if an
+#   over-zealous hardening change had rewritten the operator's explicit 0.0.0.0 to
+#   loopback -- the exact regression it exists to catch. It now asserts the host.
+#
+#   STILL HERE ON PURPOSE: getFromDomain, addArHeaderSimple and addArHeaderFull are
+#   private, so their tests stay. Verified load-bearing: commenting the
+#   `_ = @import` reference drops the run from 46 to 44 tests.
+#
+# treewalk.zig 482: its tests do NOT move. They use countLabels, nextTarget,
+#   oneLabelBelow and RecordSelector, all private, and publishing internals to
+#   satisfy a line count is the worse trade.
+#
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -9,5 +30,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-816 src/main.zig
+768 src/main.zig
 482 src/treewalk.zig
