@@ -75,5 +75,11 @@ ZmqTopic        = dmarc
 # MaxHeaders     = 500
 # MaxHeaderBytes = 1M
 
+# Loopback. "inbound" describes the mail, not this socket: the client is always the
+# local Postfix. The milter protocol has no authentication, and this daemon decides
+# disposition -- anything that can reach this port feeds it an Authentication-Results
+# it will believe, which is finding M-1/X-1 without forging a header, and under
+# p=reject it decides what gets bounced. Widen only if Postfix genuinely runs on
+# another machine, and then restrict it with pf.
 [listener:inbound]
-Socket          = inet:8894@0.0.0.0
+Socket          = inet:8894@127.0.0.1

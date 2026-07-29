@@ -104,8 +104,14 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         }
     }
 
+    // Loopback, NOT 0.0.0.0. The milter protocol has no authentication, so anything
+    // reaching this socket is trusted absolutely -- and this daemon is the one that
+    // decides disposition. A reachable port lets an attacker feed a message whose
+    // Authentication-Results it will believe, which is finding M-1/X-1 delivered
+    // without needing to forge a header at all, and under p=reject it decides what
+    // gets bounced. Postfix is the only intended client and it is local.
     if (addrs.items.len == 0) {
-        try addrs.append(allocator, .{ .tcp = .{ .host = "0.0.0.0", .port = 8894 } });
+        try addrs.append(allocator, .{ .tcp = .{ .host = "127.0.0.1", .port = 8894 } });
     }
 
     const dns_ns_raw = global.getOrDefault("DnsNameserver", "127.0.0.1");
@@ -715,6 +721,39 @@ test {
     _ = psl;
 }
 
+// The implicit listener binds loopback, never 0.0.0.0.
+//
+// Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. This daemon decides
+// disposition, so a reachable port lets an attacker supply a message whose
+// Authentication-Results it will believe -- M-1/X-1 without forging a header -- and
+// under p=reject it decides what gets bounced. The milter protocol authenticates
+// nobody, so reachability IS authorization.
+test "the implicit listener binds loopback, not every interface" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
+    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
+
+    try std.testing.expectEqual(@as(usize, 1), dmarc_cfg.listen_addresses.len);
+    switch (dmarc_cfg.listen_addresses[0]) {
+        .tcp => |tcp| {
+            try std.testing.expectEqualStrings("127.0.0.1", tcp.host);
+            try std.testing.expectEqual(@as(u16, 8894), tcp.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// A safe default, not a policy override. `parse config minimal` below binds
+// 0.0.0.0 explicitly and must keep working, so that case covers the operator who
+// genuinely needs a routable socket.
 test "parse config minimal" {
     const ini_text =
         \\[global]

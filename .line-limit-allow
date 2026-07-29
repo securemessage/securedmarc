@@ -1,3 +1,7 @@
+# 2026-07-29, X-13: the implicit listener now binds loopback instead of 0.0.0.0.
+#   main.zig 777 -> 816. One test plus the reasoning. This daemon decides disposition,
+#   so a reachable socket meant an attacker could supply the Authentication-Results it
+#   evaluates -- M-1/X-1 without forging a header in transit.
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
 # file that reaches the goal drops off this list entirely.
@@ -5,17 +9,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-# src/treewalk.zig 433 -> 482 and src/main.zig 807 -> 777, from one change: the
-#   RFC 9989 conformance harness needed the identifier Organizational Domain
-#   helper, which lived privately in main.zig as `orgWalk`. Rather than let
-#   securedmarc-check carry a second copy -- which would make a conformance
-#   result a statement about the checker instead of the shipped evaluator, the
-#   precise failure the external-oracle gate exists to prevent -- it moved to
-#   treewalk.zig beside the walk it performs, and main.zig calls it there.
-#
-#   So this is a relocation that deletes a duplicate rather than growth: the
-#   larger ceiling on treewalk.zig is paid for by the smaller one on main.zig,
-#   and there is now one implementation of the three §4.10.2 skip conditions
-#   instead of the two there would otherwise have been.
-777 src/main.zig
+816 src/main.zig
 482 src/treewalk.zig

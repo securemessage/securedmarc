@@ -227,7 +227,21 @@ or
 .El
 .Pp
 If no listener sections are defined, the default is
-.Dq inet:8894@0.0.0.0 .
+.Dq inet:8894@127.0.0.1 ,
+loopback only.
+.Pp
+The milter protocol carries no authentication, so any client that can reach this
+socket is trusted completely, and this daemon is the one that decides disposition.
+The caller supplies the
+.Va Authentication-Results
+fields this daemon evaluates, so a reachable socket defeats DMARC without needing
+to forge a header in transit, and under
+.Dv p=reject
+it decides which mail is refused.
+Only the local MTA should ever connect.
+Bind a routable address only when the MTA runs on a different machine, and
+restrict access to it with
+.Xr pf 4 .
 .Sh SIGNALS
 .Bl -tag -width "SIGTERM" -compact
 .It Dv SIGHUP

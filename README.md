@@ -38,7 +38,7 @@ PidFile         = /var/run/securedmarc/securedmarc.pid
 DnsNameserver   = 127.0.0.1
 
 [listener:inbound]
-Socket          = inet:8894@0.0.0.0
+Socket          = inet:8894@127.0.0.1
 EOF
 
 # Install and start
