@@ -108,8 +108,9 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     for (cfg.section_order.items) |section_name| {
         if (mem.startsWith(u8, section_name, "listener:")) {
             const section = cfg.getSection(section_name) orelse continue;
-            const socket_str = section.get("Socket") orelse continue;
-            const addr = listener_mod.ListenAddress.parse(socket_str) catch continue;
+
+            // X-14: a malformed or missing Socket is refused, not skipped.
+            const addr = try listener_mod.parseListenerSocket(section_name, section.get("Socket"));
             try addrs.append(allocator, addr);
         }
     }
@@ -663,6 +664,49 @@ test {
     _ = alignment;
     _ = treewalk;
     _ = psl;
+}
+
+// X-14. A malformed Socket must be refused rather than skipped -- and in
+// particular must NOT fall through to the loopback default below, which would
+// leave the daemon listening somewhere the operator never named while its
+// startup log reported success.
+test "a malformed listener Socket is refused, not replaced by the default" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:typo]
+        \\Socket = inet6:8894@::1
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.InvalidListenerSocket, parseDmarcConfig(std.testing.allocator, &cfg));
+}
+
+test "a hostname in Socket is refused at config time" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:main]
+        \\Socket = inet:8894@localhost
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.InvalidListenerSocket, parseDmarcConfig(std.testing.allocator, &cfg));
+}
+
+test "a listener section with no Socket is refused" {
+    var cfg = try config_mod.parse(std.testing.allocator,
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\
+        \\[listener:empty]
+        \\MaxConnections = 10
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectError(error.MissingListenerSocket, parseDmarcConfig(std.testing.allocator, &cfg));
 }
 
 // The implicit listener binds loopback, never 0.0.0.0.
