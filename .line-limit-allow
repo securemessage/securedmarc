@@ -13,21 +13,31 @@
 #   supply the Authentication-Results it evaluates -- M-1/X-1 without forging a
 #   header in transit -- and under p=reject decide what gets bounced.
 #
-# 2026-07-29, test extraction DONE: main.zig 816 -> 768. The two listener tests
-#   moved to src/main_test.zig. parseDmarcConfig and DmarcConfig were already pub.
+# 2026-07-29, REVERTED AND THE METRIC FIXED INSTEAD. Earlier the same day I moved two
+#   listener tests out of main.zig into a new src/main_test.zig and recorded 816 -> 768
+#   as a reduction. That was gaming the metric: the checker excluded *_test.zig FILES
+#   while counting test BLOCKS in the files it did check, so relocation changed the
+#   number and nothing else. main_test.zig is deleted and the tests are back beside the
+#   code they test, which is Zig's convention.
 #
-#   `parse config minimal` was STRENGTHENED while being moved: it asserted only that
-#   the config parsed and returned one listener, so it would still have passed if an
-#   over-zealous hardening change had rewritten the operator's explicit 0.0.0.0 to
-#   loopback -- the exact regression it exists to catch. It now asserts the host.
+#   THE COUNTER NOW MEASURES PRODUCTION LINES ONLY, in any file. Tests never count,
+#   wherever they live -- see securemilter-lib/tools/check-line-limit.sh.
 #
-#   STILL HERE ON PURPOSE: getFromDomain, addArHeaderSimple and addArHeaderFull are
-#   private, so their tests stay. Verified load-bearing: commenting the
-#   `_ = @import` reference drops the run from 46 to 44 tests.
+#   744 is the production size on the new basis; 768 and 816 measured something else.
 #
-# treewalk.zig 482: its tests do NOT move. They use countLabels, nextTarget,
-#   oneLabelBelow and RecordSelector, all private, and publishing internals to
-#   satisfy a line count is the worse trade.
+#   KEPT FROM THAT PASS, because it was a real improvement rather than a relocation:
+#   `parse config minimal` asserted only that the config parsed and returned one
+#   listener, while its name and comment claimed it covered the operator who needs a
+#   routable socket. It would have passed unchanged if a hardening change had rewritten
+#   an explicit 0.0.0.0 to loopback -- the exact regression it exists to catch. It now
+#   asserts host and port, and is renamed to say what it tests. A test whose name
+#   promises more than its assertions deliver is worse than an absent one.
+#
+# treewalk.zig is NO LONGER LISTED: 482 total but 336 PRODUCTION, so it was never over
+#   the goal -- the metric was counting its 146 lines of tests. Five other files across
+#   the suite dropped off for the same reason when the counter was fixed. Its tests were
+#   never movable anyway (countLabels, nextTarget, oneLabelBelow, RecordSelector are all
+#   private), which is what made the old metric's demand impossible to satisfy honestly.
 #
 # Files currently over the 400-line goal, with the ceiling each
 # may not exceed. Ceilings tighten by themselves as files shrink; a
@@ -36,5 +46,8 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-768 src/main.zig
-482 src/treewalk.zig
+#
+# WHY A CEILING EXISTS BELONGS ABOVE THIS HEADER. Comments there are
+# preserved when the list is rewritten; this header and the entries
+# under it are regenerated every time a ceiling moves.
+744 src/main.zig
