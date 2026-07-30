@@ -12,7 +12,6 @@ const daemon_mod = securemilter.daemon;
 const auth_results = securemilter.auth_results;
 const auth_stamp = securemilter.auth_stamp;
 const escape = securemilter.escape;
-const commands = securemilter.milter.commands;
 const codec = securemilter.milter.codec;
 const responses = securemilter.milter.responses;
 const negotiate = securemilter.milter.negotiate;
@@ -284,12 +283,6 @@ pub fn main() !void {
     const required_actions = negotiate.ActionFlags{ .add_headers = true, .change_headers = true };
 
     const callbacks = worker_mod.Callbacks{
-        .on_connect = onConnect,
-        .on_helo = onHelo,
-        .on_mail_from = onMailFrom,
-        .on_header = onHeader,
-        .on_eoh = onEoh,
-        .on_body = onBody,
         .on_eom = onEom,
         .on_reload = onWorkerReload,
         .required_actions = required_actions,
@@ -319,38 +312,21 @@ pub fn main() !void {
 // Milter Callbacks
 // =============================================================================
 
-fn onConnect(conn: *connection_mod.Connection, _: commands.ConnectInfo) u8 {
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
-
-fn onHelo(conn: *connection_mod.Connection, _: []const u8) u8 {
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
-
-fn onMailFrom(conn: *connection_mod.Connection, _: []const u8) u8 {
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
-
-fn onHeader(conn: *connection_mod.Connection, _: []const u8, _: []const u8) u8 {
-    // Headers are accumulated automatically by Connection.addHeader() in the worker
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
-
-fn onEoh(conn: *connection_mod.Connection) u8 {
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
-
-fn onBody(conn: *connection_mod.Connection, _: []const u8) u8 {
-    // DMARC doesn't need body content — but we don't request SMFIP_NOBODY
-    // since the protocol requires us to accept what Postfix sends.
-    _ = conn;
-    return @intFromEnum(responses.Code.@"continue");
-}
+// This daemon acts only at end-of-message, so `on_eom` is the only phase
+// registered below. An unregistered callback yields `Code.continue`, which is
+// exactly what the six stubs that used to sit here returned.
+//
+// Two of them carried reasoning worth keeping, since neither is recoverable from
+// the remaining code:
+//
+//   - Headers need no callback. The worker calls `Connection.addHeader` itself
+//     before dispatching, so accumulation does not depend on this daemon
+//     registering anything; a stub here only looked as though it did.
+//
+//   - `skip_flags` deliberately does NOT set `no_body`, even though DMARC never
+//     reads the body. Declining the body is a negotiation this daemon could win
+//     and chooses not to: we accept whatever Postfix sends. Contrast
+//     `securespf`, which does set it.
 
 fn onEom(conn: *connection_mod.Connection) u8 {
     const start_ns = std.time.nanoTimestamp();
