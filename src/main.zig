@@ -417,7 +417,7 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     const envelope_domain = getEnvelopeDomain(conn);
 
     for (conn.headers.items) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
         // Only trust A-R headers from our own authserv-id
         if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
 
@@ -497,7 +497,7 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     }
 
     const from_org = treewalk.organizationalDomain(&author_walk, pslPtr());
-    const is_subdomain = !eqlIgnoreCase(from_domain, from_org);
+    const is_subdomain = !std.ascii.eqlIgnoreCase(from_domain, from_org);
 
     // Step 4: Resolve each authenticated identifier's own Organizational
     // Domain. Only needed for relaxed mode and only for identifiers that
@@ -545,14 +545,14 @@ fn pslPtr() ?*const psl.PublicSuffixList {
 fn countFromHeaders(conn: *connection_mod.Connection) usize {
     var count: usize = 0;
     for (conn.headers.items) |hdr| {
-        if (eqlIgnoreCase(hdr.name, "From")) count += 1;
+        if (std.ascii.eqlIgnoreCase(hdr.name, "From")) count += 1;
     }
     return count;
 }
 
 fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
     for (conn.headers.items) |hdr| {
-        if (eqlIgnoreCase(hdr.name, "From")) {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "From")) {
             // Extract email address from From: header value
             // Handle "Display Name <addr@domain>" and bare "addr@domain"
             const val = mem.trim(u8, hdr.value, &std.ascii.whitespace);
@@ -576,7 +576,7 @@ fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
 fn extractDkimDomain(conn: *connection_mod.Connection) ?[]const u8 {
     // Look through A-R headers for "header.d=<domain>" property
     for (conn.headers.items) |hdr| {
-        if (!eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
         if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
         // Simple extraction: find "header.d=" in the header value
         if (mem.indexOf(u8, hdr.value, "header.d=")) |pos| {
@@ -667,19 +667,6 @@ fn addArHeaderFull(
 
 fn dupeOrNull(allocator: Allocator, s: []const u8) ?[]const u8 {
     return allocator.dupe(u8, s) catch null;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 // =============================================================================

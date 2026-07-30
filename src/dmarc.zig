@@ -11,9 +11,9 @@ pub const Policy = enum {
     reject,
 
     pub fn fromString(s: []const u8) ?Policy {
-        if (eqlIgnoreCase(s, "none")) return .none;
-        if (eqlIgnoreCase(s, "quarantine")) return .quarantine;
-        if (eqlIgnoreCase(s, "reject")) return .reject;
+        if (std.ascii.eqlIgnoreCase(s, "none")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "quarantine")) return .quarantine;
+        if (std.ascii.eqlIgnoreCase(s, "reject")) return .reject;
         return null;
     }
 
@@ -57,7 +57,7 @@ pub const TestMode = enum {
     pub fn fromString(s: []const u8) TestMode {
         // §4.8: a syntax error in the remainder of the record is discarded in
         // favour of the default, so anything that is not "y" reads as t=n.
-        if (eqlIgnoreCase(s, "y")) return .testing;
+        if (std.ascii.eqlIgnoreCase(s, "y")) return .testing;
         return .apply;
     }
 };
@@ -75,8 +75,8 @@ pub const Psd = enum {
     unknown,
 
     pub fn fromString(s: []const u8) Psd {
-        if (eqlIgnoreCase(s, "y")) return .yes;
-        if (eqlIgnoreCase(s, "n")) return .no;
+        if (std.ascii.eqlIgnoreCase(s, "y")) return .yes;
+        if (std.ascii.eqlIgnoreCase(s, "n")) return .no;
         return .unknown;
     }
 };
@@ -213,7 +213,7 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
     // So "V=DMARC1" is a valid record and "v=dmarc1" is not one at all. Both
     // used to parse, which meant a malformed record was read as policy.
     if (trimmed.len < 2) return null;
-    if (toLower(trimmed[0]) != 'v') return null;
+    if (std.ascii.toLower(trimmed[0]) != 'v') return null;
     if (trimmed[1] != '=') return null;
     if (!mem.startsWith(u8, trimmed[2..], "DMARC1")) return null;
     // After v=DMARC1, must be end of string, semicolon, or whitespace
@@ -238,10 +238,10 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
         const tag = mem.trim(u8, pair[0..eq], &std.ascii.whitespace);
         const val = mem.trim(u8, pair[eq + 1 ..], &std.ascii.whitespace);
 
-        if (eqlIgnoreCase(tag, "p")) {
+        if (std.ascii.eqlIgnoreCase(tag, "p")) {
             record.policy = Policy.fromString(val) orelse continue;
             found_policy = true;
-        } else if (eqlIgnoreCase(tag, "sp")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "sp")) {
             // An *absent* sp= defaults to p=; an sp= with an unparseable value
             // is a §4.10.1 trigger. Leaving subdomain_policy null for both
             // would silently downgrade the second case to the first.
@@ -249,25 +249,25 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
                 record.subdomain_tag_invalid = true;
                 continue;
             };
-        } else if (eqlIgnoreCase(tag, "np")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "np")) {
             record.np = Policy.fromString(val) orelse {
                 record.subdomain_tag_invalid = true;
                 continue;
             };
-        } else if (eqlIgnoreCase(tag, "adkim")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "adkim")) {
             record.adkim = parseAlignmentTag(val);
-        } else if (eqlIgnoreCase(tag, "aspf")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "aspf")) {
             record.aspf = parseAlignmentTag(val);
-        } else if (eqlIgnoreCase(tag, "t")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "t")) {
             record.testing = TestMode.fromString(val);
-        } else if (eqlIgnoreCase(tag, "rua")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "rua")) {
             record.rua = val;
             record.rua_valid = hasValidReportingUri(val);
-        } else if (eqlIgnoreCase(tag, "ruf")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "ruf")) {
             record.ruf = val;
-        } else if (eqlIgnoreCase(tag, "fo")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "fo")) {
             record.fo = val;
-        } else if (eqlIgnoreCase(tag, "psd")) {
+        } else if (std.ascii.eqlIgnoreCase(tag, "psd")) {
             record.psd = Psd.fromString(val);
         }
     }
@@ -347,21 +347,8 @@ fn parseAlignmentTag(val: []const u8) alignment.AlignmentMode {
     return .relaxed;
 }
 
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
 fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
     if (haystack.len < prefix.len) return false;
-    return eqlIgnoreCase(haystack[0..prefix.len], prefix);
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
 

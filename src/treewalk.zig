@@ -54,7 +54,7 @@ pub const Walk = struct {
     /// The record published at the starting domain itself, if any.
     pub fn recordAtStart(self: *const Walk) ?dmarc.DmarcRecord {
         for (self.found.items) |f| {
-            if (eqlIgnoreCase(f.domain, self.start)) return f.record;
+            if (std.ascii.eqlIgnoreCase(f.domain, self.start)) return f.record;
         }
         return null;
     }
@@ -105,7 +105,7 @@ pub fn orgWalk(
     if (!ident.passed()) return null;
     const domain = ident.domain orelse return null;
 
-    if (eqlIgnoreCase(domain, from_domain)) {
+    if (std.ascii.eqlIgnoreCase(domain, from_domain)) {
         ident.org_domain = from_org;
         return null;
     }
@@ -176,7 +176,7 @@ pub fn organizationalDomain(w: *const Walk, psl: ?*const psl_mod.PublicSuffixLis
     // below the declaring domain.
     for (w.found.items) |f| {
         if (f.record.psd != .yes) continue;
-        if (eqlIgnoreCase(f.domain, w.start)) continue;
+        if (std.ascii.eqlIgnoreCase(f.domain, w.start)) continue;
         return oneLabelBelow(w.start, f.domain) orelse f.domain;
     }
 
@@ -301,10 +301,6 @@ pub fn countLabels(domain: []const u8) usize {
         if (c == '.') count += 1;
     }
     return count;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 // =============================================================================

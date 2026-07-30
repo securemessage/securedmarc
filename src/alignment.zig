@@ -21,7 +21,7 @@ pub const Identifier = struct {
 
     pub fn passed(self: Identifier) bool {
         const r = self.result orelse return false;
-        return eqlIgnoreCase(r, "pass");
+        return std.ascii.eqlIgnoreCase(r, "pass");
     }
 };
 
@@ -45,11 +45,11 @@ pub fn isAligned(
     if (from_domain.len == 0 or auth_domain.len == 0) return false;
 
     return switch (mode) {
-        .strict => eqlIgnoreCase(from_domain, auth_domain),
+        .strict => std.ascii.eqlIgnoreCase(from_domain, auth_domain),
         .relaxed => blk: {
             const auth_org = auth.org_domain orelse auth_domain;
             if (from_org.len == 0 or auth_org.len == 0) break :blk false;
-            break :blk eqlIgnoreCase(from_org, auth_org);
+            break :blk std.ascii.eqlIgnoreCase(from_org, auth_org);
         },
     };
 }
@@ -70,19 +70,6 @@ pub fn stripAngleBrackets(addr: []const u8) []const u8 {
     if (s.len > 0 and s[0] == '<') s = s[1..];
     if (s.len > 0 and s[s.len - 1] == '>') s = s[0 .. s.len - 1];
     return s;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (toLower(ca) != toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn toLower(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + 32;
-    return c;
 }
 
 // =============================================================================
