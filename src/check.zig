@@ -30,27 +30,13 @@ const process = std.process;
 const Allocator = mem.Allocator;
 
 const securemilter = @import("securemilter");
+const cli = securemilter.cli.Tool("securedmarc-check");
 const dns_mod = securemilter.dns;
 
 const dmarc = @import("dmarc.zig");
 const treewalk = @import("treewalk.zig");
 const alignment = @import("alignment.zig");
 const psl_mod = @import("psl.zig");
-
-fn writeOut(data: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, data) catch {};
-}
-
-fn writeErr(data: []const u8) void {
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
-}
-
-fn fatal(msg: []const u8) noreturn {
-    writeErr("securedmarc-check: ");
-    writeErr(msg);
-    writeErr("\n");
-    process.exit(2);
-}
 
 const Usage =
     \\Usage: securedmarc-check [options]
@@ -103,31 +89,31 @@ fn parseArgs(allocator: Allocator) !Args {
 
     while (it.next()) |arg| {
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            writeOut(Usage);
+            cli.out(Usage);
             process.exit(0);
         } else if (mem.eql(u8, arg, "--from")) {
-            result.from = try allocator.dupe(u8, it.next() orelse fatal("--from needs a value"));
+            result.from = try allocator.dupe(u8, it.next() orelse cli.fatal("--from needs a value"));
         } else if (mem.eql(u8, arg, "--mailfrom")) {
-            result.mailfrom = try allocator.dupe(u8, it.next() orelse fatal("--mailfrom needs a value"));
+            result.mailfrom = try allocator.dupe(u8, it.next() orelse cli.fatal("--mailfrom needs a value"));
         } else if (mem.eql(u8, arg, "--spf")) {
-            result.spf = try allocator.dupe(u8, it.next() orelse fatal("--spf needs a value"));
+            result.spf = try allocator.dupe(u8, it.next() orelse cli.fatal("--spf needs a value"));
         } else if (mem.eql(u8, arg, "--dkim")) {
-            result.dkim = try allocator.dupe(u8, it.next() orelse fatal("--dkim needs a value"));
+            result.dkim = try allocator.dupe(u8, it.next() orelse cli.fatal("--dkim needs a value"));
         } else if (mem.eql(u8, arg, "--dkim-result")) {
-            result.dkim_result = try allocator.dupe(u8, it.next() orelse fatal("--dkim-result needs a value"));
+            result.dkim_result = try allocator.dupe(u8, it.next() orelse cli.fatal("--dkim-result needs a value"));
         } else if (mem.eql(u8, arg, "--psl")) {
-            result.psl_path = try allocator.dupe(u8, it.next() orelse fatal("--psl needs a value"));
+            result.psl_path = try allocator.dupe(u8, it.next() orelse cli.fatal("--psl needs a value"));
         } else if (mem.eql(u8, arg, "-n")) {
-            result.nameserver = try allocator.dupe(u8, it.next() orelse fatal("-n needs a value"));
+            result.nameserver = try allocator.dupe(u8, it.next() orelse cli.fatal("-n needs a value"));
         } else if (mem.eql(u8, arg, "-p")) {
-            const raw = it.next() orelse fatal("-p needs a value");
-            result.port = std.fmt.parseInt(u16, raw, 10) catch fatal("invalid port");
+            const raw = it.next() orelse cli.fatal("-p needs a value");
+            result.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("invalid port");
         } else {
-            fatal("unknown argument");
+            cli.fatal("unknown argument");
         }
     }
 
-    if (result.from == null) fatal("--from is required (see -h)");
+    if (result.from == null) cli.fatal("--from is required (see -h)");
     return result;
 }
 
@@ -135,10 +121,10 @@ fn parseArgs(allocator: Allocator) !Args {
 /// being omitted, so a consumer can tell "walked, got nothing" from "never
 /// asked" only by the key's presence, and every run yields the same key set.
 fn emit(key: []const u8, value: []const u8) void {
-    writeOut(key);
-    writeOut("=");
-    writeOut(value);
-    writeOut("\n");
+    cli.out(key);
+    cli.out("=");
+    cli.out(value);
+    cli.out("\n");
 }
 
 fn emitAll(
@@ -179,7 +165,7 @@ pub fn main() !void {
     defer if (psl) |*p| p.deinit();
     if (args.psl_path) |path| {
         var list = psl_mod.PublicSuffixList.init(allocator);
-        list.loadFile(path) catch fatal("could not load the public suffix list");
+        list.loadFile(path) catch cli.fatal("could not load the public suffix list");
         psl = list;
     }
     const psl_ptr: ?*const psl_mod.PublicSuffixList = if (psl) |*p| p else null;
