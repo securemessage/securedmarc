@@ -293,18 +293,41 @@ pub fn evaluate(
     from_domain: []const u8,
     from_org_domain: []const u8,
     spf: alignment.Identifier,
-    dkim: alignment.Identifier,
+    dkim: []const alignment.Identifier,
 ) Result {
     const spf_aligned = spf.passed() and
         alignment.isAligned(from_domain, from_org_domain, spf, record.aspf);
 
-    const dkim_aligned = dkim.passed() and
-        alignment.isAligned(from_domain, from_org_domain, dkim, record.adkim);
+    const dkim_aligned = alignedDkim(record, from_domain, from_org_domain, dkim) != null;
 
     // Pass if either mechanism is aligned. The DMARC *result* is "fail"
     // otherwise, regardless of policy: the policy determines the action the
     // MTA takes, not the result value in the A-R header.
     return if (spf_aligned or dkim_aligned) .pass else .fail;
+}
+
+/// The first verified DKIM identifier that aligns with the Author Domain.
+///
+/// A message may carry several DKIM signatures, and DMARC succeeds if *any*
+/// verified one is aligned (RFC 9989 §4.10.3). Evaluating a single identifier
+/// meant an aligned signature sitting behind a failing one was invisible, and —
+/// because the result and the `d=` domain used to be collected by two
+/// independent scans — the pair being judged was not necessarily a pair that
+/// appeared in the header at all (audit M-6).
+///
+/// Returned rather than reduced to a bool so the caller can report the pair the
+/// verdict actually rests on, instead of re-deriving it and possibly naming a
+/// different signature than the one that passed.
+pub fn alignedDkim(
+    record: *const DmarcRecord,
+    from_domain: []const u8,
+    from_org_domain: []const u8,
+    dkim: []const alignment.Identifier,
+) ?alignment.Identifier {
+    for (dkim) |d| {
+        if (d.passed() and alignment.isAligned(from_domain, from_org_domain, d, record.adkim)) return d;
+    }
+    return null;
 }
 
 /// Get the disposition action string for an A-R header reason comment.
@@ -351,4 +374,3 @@ fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
     if (haystack.len < prefix.len) return false;
     return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
-

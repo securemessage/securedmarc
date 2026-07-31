@@ -223,8 +223,12 @@ pub fn main() !void {
     var dkim_walk = treewalk.orgWalk(allocator, &resolver, rec.adkim, from_domain, from_org, &dkim_ident, psl_ptr);
     defer if (dkim_walk) |*w| w.deinit();
 
-    // Step 5 and 6.
-    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, dkim_ident);
+    // Step 5 and 6. The CLI describes one DKIM identifier, so it passes a
+    // one-element slice rather than gaining its own copy of the any-aligned
+    // rule — the checker has to exercise the shipped `evaluate`, or a
+    // conformance result would speak about the checker instead of the daemon.
+    const dkim_idents = [_]alignment.Identifier{dkim_ident};
+    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, &dkim_idents);
     const disposition = dmarc.getDisposition(&rec, is_subdomain);
 
     emitAll(

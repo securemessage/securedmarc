@@ -191,7 +191,7 @@ test "evaluate pass with SPF aligned" {
         .org_domain = "example.com",
         .result = "pass",
     };
-    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, .{}));
+    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, &.{}));
 }
 
 test "evaluate pass with DKIM aligned" {
@@ -206,14 +206,14 @@ test "evaluate pass with DKIM aligned" {
         .org_domain = "example.com",
         .result = "pass",
     };
-    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, dkim));
+    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, &.{dkim}));
 }
 
 test "evaluate fail neither aligned" {
     const record = DmarcRecord{ .policy = .reject, .aspf = .strict, .adkim = .strict };
     const spf = alignment.Identifier{ .domain = "other.com", .result = "pass" };
     const dkim = alignment.Identifier{ .domain = "different.com", .result = "pass" };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, dkim));
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, &.{dkim}));
 }
 
 test "evaluate fail SPF pass but not aligned strict" {
@@ -223,7 +223,7 @@ test "evaluate fail SPF pass but not aligned strict" {
         .org_domain = "example.com",
         .result = "pass",
     };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, .{}));
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, &.{}));
 }
 
 test "evaluate fail when public suffixes no longer collapse" {
@@ -237,13 +237,47 @@ test "evaluate fail when public suffixes no longer collapse" {
     };
     try std.testing.expectEqual(
         Result.fail,
-        evaluate(&record, "a.victim.co.uk", "victim.co.uk", spf, .{}),
+        evaluate(&record, "a.victim.co.uk", "victim.co.uk", spf, &.{}),
     );
 }
 
 test "evaluate fail when no identifier authenticated" {
     const record = DmarcRecord{ .policy = .reject };
-    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", .{}, .{}));
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", .{}, &.{}));
+}
+
+test "M-6: an aligned signature behind a failing one still passes" {
+    // Signature order is chosen by the sender. Taking only the first dkim
+    // result made a legitimate aligned signature invisible.
+    const record = DmarcRecord{ .policy = .reject, .aspf = .strict, .adkim = .strict };
+    const spf = alignment.Identifier{ .domain = "other.com", .result = "fail" };
+    const dkim = [_]alignment.Identifier{
+        .{ .domain = "noise.test", .result = "fail" },
+        .{ .domain = "example.com", .result = "pass" },
+    };
+    try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, &dkim));
+}
+
+test "M-6: one signature's pass cannot carry another's domain" {
+    // The bypass shape: a pass earned by attacker.test must not license
+    // alignment for victim.test just because both appear in the header.
+    const record = DmarcRecord{ .policy = .reject, .aspf = .strict, .adkim = .strict };
+    const dkim = [_]alignment.Identifier{
+        .{ .domain = "attacker.test", .result = "pass" },
+        .{ .domain = "victim.test", .result = "fail" },
+    };
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "victim.test", "victim.test", .{}, &dkim));
+    try std.testing.expect(dmarc.alignedDkim(&record, "victim.test", "victim.test", &dkim) == null);
+}
+
+test "M-6: alignedDkim names the signature the verdict rests on" {
+    const record = DmarcRecord{ .policy = .reject, .adkim = .strict };
+    const dkim = [_]alignment.Identifier{
+        .{ .domain = "other.test", .result = "pass" },
+        .{ .domain = "example.com", .result = "pass" },
+    };
+    const winner = dmarc.alignedDkim(&record, "example.com", "example.com", &dkim).?;
+    try std.testing.expectEqualStrings("example.com", winner.domain.?);
 }
 
 test "subdomain policy" {

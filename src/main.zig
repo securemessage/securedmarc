@@ -25,6 +25,17 @@ pub const dmarc = @import("dmarc.zig");
 pub const alignment = @import("alignment.zig");
 pub const treewalk = @import("treewalk.zig");
 pub const psl = @import("psl.zig");
+pub const upstream = @import("upstream.zig");
+
+/// How many DKIM results from `Authentication-Results` are evaluated.
+///
+/// Every relaxed-mode identifier that passed can cost one DNS tree walk, and
+/// the number of `dkim=` results in the header is chosen by whoever sent the
+/// message. The cap is the same reasoning as the other content limits (audit
+/// X-4): bound work that an attacker gets to size. Ten is far above what real
+/// mail carries — a message with more aligned candidates than this is not one
+/// whose eleventh signature decides the verdict.
+const MAX_DKIM_IDENTIFIERS = 10;
 
 /// SecureDMARC runtime configuration parsed from INI config.
 pub const DmarcConfig = struct {
@@ -376,41 +387,23 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     };
 
     // Step 2: Parse upstream Authentication-Results headers
-    var spf_result: ?[]const u8 = null;
-    var dkim_result: ?[]const u8 = null;
-    var dkim_domain: ?[]const u8 = null;
-
     // The envelope-from domain is what SPF authenticated
     const envelope_domain = getEnvelopeDomain(conn);
 
-    for (conn.headers.items) |hdr| {
-        if (!std.ascii.eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
-        // Only trust A-R headers from our own authserv-id
-        if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
+    // Each DKIM signature contributes its own (result, d=) pair, and they stay
+    // paired — see `upstream.zig`, which is where audit M-6 lives.
+    var up = upstream.collect(conn.allocator, conn.headers.items, g_authserv_id, MAX_DKIM_IDENTIFIERS);
+    defer up.deinit(conn.allocator);
 
-        var parsed = auth_results.parseResults(conn.allocator, hdr.value) catch continue;
-        defer parsed.deinit(conn.allocator);
+    const spf_result = up.spf_result;
+    const dkim_idents = up.dkim;
 
-        if (spf_result == null) {
-            if (parsed.getResult("spf")) |r| {
-                spf_result = dupeOrNull(conn.allocator, r);
-            }
-        }
-        if (dkim_result == null) {
-            if (parsed.getResult("dkim")) |r| {
-                dkim_result = dupeOrNull(conn.allocator, r);
-            }
-        }
+    if (up.truncated) {
+        log.warn(
+            "more than {d} DKIM results in Authentication-Results; evaluating the first {d}",
+            .{ MAX_DKIM_IDENTIFIERS, MAX_DKIM_IDENTIFIERS },
+        );
     }
-    defer {
-        if (spf_result) |s| conn.allocator.free(s);
-        if (dkim_result) |s| conn.allocator.free(s);
-        if (dkim_domain) |s| conn.allocator.free(s);
-    }
-
-    // Try to extract DKIM d= domain from header properties
-    // (simplified: look for header.d= in A-R header text)
-    dkim_domain = extractDkimDomain(conn);
 
     // Step 3: Policy discovery and Organizational Domain, both by DNS tree
     // walk (RFC 9989 §4.10). The walk starts at the Author Domain: if it
@@ -470,15 +463,32 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     // Domain. Only needed for relaxed mode and only for identifiers that
     // actually passed — strict mode is a string comparison (§4.10.2).
     var spf_ident = alignment.Identifier{ .domain = envelope_domain, .result = spf_result };
-    var dkim_ident = alignment.Identifier{ .domain = dkim_domain, .result = dkim_result };
 
     var spf_walk = treewalk.orgWalk(conn.allocator, resolver, rec.aspf, from_domain, from_org, &spf_ident, pslPtr());
     defer if (spf_walk) |*w| w.deinit();
-    var dkim_walk = treewalk.orgWalk(conn.allocator, resolver, rec.adkim, from_domain, from_org, &dkim_ident, pslPtr());
-    defer if (dkim_walk) |*w| w.deinit();
+
+    // One walk per DKIM identifier, each kept alive because the identifier's
+    // `org_domain` points into it. `orgWalk` returns null for the cases that
+    // need no DNS at all (strict mode, a result that did not pass, a domain
+    // equal to the Author Domain), so the common single-signature message still
+    // costs exactly one walk. MAX_DKIM_IDENTIFIERS is what stops a message
+    // carrying a hundred signatures from buying a hundred tree walks (X-4).
+    var dkim_walks: [MAX_DKIM_IDENTIFIERS]?treewalk.Walk = @splat(null);
+    defer for (&dkim_walks) |*w| {
+        if (w.*) |*walk| walk.deinit();
+    };
+    for (dkim_idents, 0..) |*ident, i| {
+        dkim_walks[i] = treewalk.orgWalk(conn.allocator, resolver, rec.adkim, from_domain, from_org, ident, pslPtr());
+    }
 
     // Step 5: Evaluate alignment
-    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, dkim_ident);
+    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, dkim_idents);
+
+    // Report the signature the verdict actually rests on: the aligned one when
+    // there is one, otherwise the first, so a `dkim=pass` in the event is never
+    // paired with a `d=` from some other signature — the M-6 defect itself.
+    const reported_dkim = dmarc.alignedDkim(&rec, from_domain, from_org, dkim_idents) orelse
+        if (dkim_idents.len > 0) dkim_idents[0] else alignment.Identifier{};
 
     // Step 6: Add Authentication-Results header
     const disposition = dmarc.getDisposition(&rec, is_subdomain);
@@ -492,8 +502,8 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
         result.toString(),
         disposition,
         spf_result orelse "none",
-        dkim_result orelse "none",
-        dkim_domain orelse "",
+        reported_dkim.result orelse "none",
+        reported_dkim.domain orelse "",
         envelope_domain orelse "",
     );
 
@@ -538,24 +548,6 @@ fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
     const raw = conn.mail_from_raw orelse return null;
     const addr = alignment.stripAngleBrackets(raw);
     return alignment.getDomainFromEmail(addr);
-}
-
-fn extractDkimDomain(conn: *connection_mod.Connection) ?[]const u8 {
-    // Look through A-R headers for "header.d=<domain>" property
-    for (conn.headers.items) |hdr| {
-        if (!std.ascii.eqlIgnoreCase(hdr.name, "Authentication-Results")) continue;
-        if (!auth_results.matchesAuthservId(hdr.value, g_authserv_id)) continue;
-        // Simple extraction: find "header.d=" in the header value
-        if (mem.indexOf(u8, hdr.value, "header.d=")) |pos| {
-            const start = pos + "header.d=".len;
-            const rest = hdr.value[start..];
-            const end = mem.indexOfAny(u8, rest, &.{ ' ', '\t', ';', '\r', '\n' }) orelse rest.len;
-            if (end > 0) {
-                return conn.allocator.dupe(u8, rest[0..end]) catch null;
-            }
-        }
-    }
-    return null;
 }
 
 fn publishEvent(
@@ -667,12 +659,18 @@ fn onWorkerReload() void {
 // Tests
 // =============================================================================
 
+// Every module has to be named here or its tests are silently skipped: the
+// test root is main.zig, and Zig only analyses what is referenced. A file added
+// without a line here still compiles, still looks tested, and never runs —
+// verified by making a test in `upstream.zig` assert false and watching
+// `zig build test` pass.
 test {
     _ = dmarc;
     _ = @import("dmarc_test.zig");
     _ = alignment;
     _ = treewalk;
     _ = psl;
+    _ = upstream;
 }
 
 // X-14. A malformed Socket must be refused rather than skipped -- and in
