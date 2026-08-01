@@ -21,8 +21,12 @@ const Psd = dmarc.Psd;
 const Result = dmarc.Result;
 const TestMode = dmarc.TestMode;
 
+const SamplingPolicy = dmarc.SamplingPolicy;
+
 const alignedDkim = dmarc.alignedDkim;
 const effectivePolicy = dmarc.effectivePolicy;
+const effectivePolicySampled = dmarc.effectivePolicySampled;
+const inSample = dmarc.inSample;
 const evaluate = dmarc.evaluate;
 const getDisposition = dmarc.getDisposition;
 const hasValidReportingUri = dmarc.hasValidReportingUri;
@@ -51,18 +55,137 @@ test "parse psd tag" {
     try std.testing.expectEqual(Psd.unknown, absent.psd);
 }
 
-test "parse full DMARC record, and pct is ignored as historic" {
-    // pct= is left in the record deliberately. RFC 9989 Appendix A.6 removes
-    // the tag, and §4.8 says unknown tags MUST be ignored, so a record still
-    // publishing it must parse exactly as if it were absent rather than be
-    // rejected -- plenty of deployed records still carry it.
+test "parse full DMARC record, including the historic pct tag" {
+    // pct= is parsed even though RFC 9989 Appendix A.6 removed it (audit M-4).
+    // Parsing and acting are separate: the value is read here so an operator who
+    // opts in can honour it, and ignored at decision time otherwise. A record
+    // still carrying pct= must in either case parse rather than be rejected --
+    // plenty of deployed records still have it.
     const r = parseRecord("v=DMARC1; p=reject; sp=quarantine; adkim=s; aspf=s; pct=50; rua=mailto:dmarc@example.com") orelse return error.ParseFailed;
     try std.testing.expectEqual(Policy.reject, r.policy);
     try std.testing.expectEqual(Policy.quarantine, r.subdomain_policy.?);
     try std.testing.expectEqual(alignment.AlignmentMode.strict, r.adkim);
     try std.testing.expectEqual(alignment.AlignmentMode.strict, r.aspf);
+    try std.testing.expectEqual(@as(u8, 50), r.pct);
     try std.testing.expectEqualStrings("mailto:dmarc@example.com", r.rua.?);
     try std.testing.expectEqual(Applicability.apply, r.applicability());
+}
+
+test "M-4: pct defaults to 100 and rejects out-of-range or unparseable values" {
+    // RFC 7489 §6.3: "integer between 0 and 100, inclusive; OPTIONAL; default is
+    // 100". Every rejected form must land on the default, and the default is the
+    // safe direction -- full enforcement, not silent sampling.
+    const absent = parseRecord("v=DMARC1; p=reject") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u8, 100), absent.pct);
+
+    const over = parseRecord("v=DMARC1; p=reject; pct=101") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u8, 100), over.pct);
+
+    const huge = parseRecord("v=DMARC1; p=reject; pct=99999") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u8, 100), huge.pct);
+
+    const junk = parseRecord("v=DMARC1; p=reject; pct=half") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u8, 100), junk.pct);
+
+    const zero = parseRecord("v=DMARC1; p=reject; pct=0") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u8, 0), zero.pct);
+}
+
+test "M-4: pct is inert unless the operator opts in" {
+    // The guard, and the one that matters most: shipped default is `ignore`,
+    // because RFC 9989 removed the tag. If this ever flipped, every domain still
+    // publishing pct=0 -- of which there are many, it was the standard way to ask
+    // for monitoring -- would silently stop being enforced.
+    const r = parseRecord("v=DMARC1; p=reject; pct=0") orelse return error.ParseFailed;
+
+    try std.testing.expectEqual(
+        Policy.reject,
+        effectivePolicySampled(&r, false, .ignore, "<a@example.com>"),
+    );
+    // And with it on, the same record steps down.
+    try std.testing.expectEqual(
+        Policy.quarantine,
+        effectivePolicySampled(&r, false, .honor, "<a@example.com>"),
+    );
+}
+
+test "M-4: an unselected message steps down one level, per RFC 7489 6.6.4" {
+    // §6.6.4: "If the email is not subject to the 'reject' policy (due to the
+    // 'pct' tag), the Mail Receiver SHOULD treat the email as though the
+    // 'quarantine' policy applies." Not `none` -- that would be a bigger
+    // downgrade than the domain asked for, the same trap t=y has.
+    const reject = parseRecord("v=DMARC1; p=reject; pct=0") orelse return error.ParseFailed;
+    try std.testing.expectEqual(
+        Policy.quarantine,
+        effectivePolicySampled(&reject, false, .honor, "<a@example.com>"),
+    );
+
+    const quarantine = parseRecord("v=DMARC1; p=quarantine; pct=0") orelse return error.ParseFailed;
+    try std.testing.expectEqual(
+        Policy.none,
+        effectivePolicySampled(&quarantine, false, .honor, "<a@example.com>"),
+    );
+
+    // pct=100 selects everything, so the declared policy stands.
+    const full = parseRecord("v=DMARC1; p=reject; pct=100") orelse return error.ParseFailed;
+    try std.testing.expectEqual(
+        Policy.reject,
+        effectivePolicySampled(&full, false, .honor, "<a@example.com>"),
+    );
+}
+
+test "M-4: sampling is stable for a given Message-ID" {
+    // The whole reason for hashing rather than drawing at random. A message
+    // deferred with a 4xx and retried must come back to the same verdict; if it
+    // did not, a sender could re-roll the sample by retrying until it slipped
+    // through, which would make pct= unenforceable rather than partial.
+    const id = "<retry-me@example.com>";
+    const first = inSample(50, id);
+    for (0..64) |_| {
+        try std.testing.expectEqual(first, inSample(50, id));
+    }
+}
+
+test "M-4: sampling approximates the requested percentage across a stream" {
+    // §6.6.4 asks for "a close approximation to the requested percentage" and "a
+    // representative sample". A stable hash could satisfy the determinism test
+    // above while selecting nothing at all, or everything -- this is the half
+    // that catches that.
+    var selected: usize = 0;
+    var buf: [64]u8 = undefined;
+    const total = 1000;
+    for (0..total) |i| {
+        const id = std.fmt.bufPrint(&buf, "<msg-{d}@example.com>", .{i}) catch unreachable;
+        if (inSample(25, id)) selected += 1;
+    }
+    // Generous bounds: this pins "roughly a quarter", not the exact hash.
+    try std.testing.expect(selected > total * 15 / 100);
+    try std.testing.expect(selected < total * 35 / 100);
+}
+
+test "M-4: pct composes with t=y and can only step further down" {
+    // Both tags are reductions and a domain publishing both means both. t=y takes
+    // reject to quarantine; an unselected sample takes it one further, to none.
+    // What must never happen is the composition stepping back UP.
+    const r = parseRecord("v=DMARC1; p=reject; t=y; pct=0") orelse return error.ParseFailed;
+    try std.testing.expectEqual(Policy.quarantine, effectivePolicy(&r, false));
+    try std.testing.expectEqual(
+        Policy.none,
+        effectivePolicySampled(&r, false, .honor, "<a@example.com>"),
+    );
+}
+
+test "M-4: a message with no Message-ID is selected, not exempted" {
+    // Treating an absent Message-ID as "not selected" would make dropping one
+    // header a way out of a domain's enforcement, and a missing Message-ID is
+    // exactly what bulk forged mail tends to lack.
+    try std.testing.expect(inSample(1, null));
+
+    const r = parseRecord("v=DMARC1; p=reject; pct=1") orelse return error.ParseFailed;
+    try std.testing.expectEqual(
+        Policy.reject,
+        effectivePolicySampled(&r, false, .honor, null),
+    );
 }
 
 test "tag names are case insensitive but the v= value is not" {

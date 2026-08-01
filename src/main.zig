@@ -53,6 +53,9 @@ pub const DmarcConfig = struct {
     zmq_endpoint: ?[]const u8,
     zmq_topic: []const u8,
     strip_auth_results: bool,
+    /// Honour a published `pct=` (audit M-4). Off by default; RFC 9989 §A.6
+    /// removed the tag.
+    apply_pct: bool,
     public_suffix_list: ?[]const u8,
     limits: connection_mod.Limits,
 };
@@ -65,6 +68,12 @@ var g_dns_config: dns_mod.ResolverConfig = .{};
 var g_zmq_endpoint: ?[]const u8 = null;
 var g_zmq_topic: []const u8 = "dmarc.evaluation";
 var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dmarc"} };
+
+/// Whether a published `pct=` is honoured (audit M-4). Off by default: RFC 9989
+/// §A.6 removed the tag, so ignoring it is what the current spec says. On is for
+/// operators who would rather keep honouring it while senders finish moving to
+/// `t=`, which is a transition still in progress.
+var g_sampling: dmarc.SamplingPolicy = .ignore;
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 
 /// `daemon.Options.spawn_threads`: start the DNS health monitor.
@@ -155,6 +164,11 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     // daemon precedes this one.
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
+    // `pct=` was removed by RFC 9989 §A.6 in favour of `t=`, so the default is to
+    // ignore it. An operator running through the transition can switch it back on
+    // for domains that have not moved yet (audit M-4).
+    const apply_pct = global.getBool("ApplyPct", false);
+
     // Optional Public Suffix List, used only to veto a tree-walk result.
     const public_suffix_list = global.get("PublicSuffixList");
 
@@ -178,6 +192,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .zmq_endpoint = zmq_endpoint,
         .zmq_topic = zmq_topic,
         .strip_auth_results = strip_auth_results,
+        .apply_pct = apply_pct,
         .public_suffix_list = public_suffix_list,
         .limits = limits,
     };
@@ -225,6 +240,7 @@ fn runDaemon() !void {
 
     // Set module-level globals
     g_authserv_id = dmarc_cfg.authserv_id;
+    g_sampling = if (dmarc_cfg.apply_pct) .honor else .ignore;
     g_dns_config = .{
         .nameservers = dmarc_cfg.dns_nameservers,
         .timeout_ms = dmarc_cfg.dns_timeout_ms,
@@ -487,7 +503,14 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
         if (dkim_idents.len > 0) dkim_idents[0] else alignment.Identifier{};
 
     // Step 6: Add Authentication-Results header
-    const disposition = dmarc.getDisposition(&rec, is_subdomain);
+    // Sampling keys off the Message-ID so a retried message keeps the verdict it
+    // was given; see `dmarc.inSample`. Absent, the message counts as selected.
+    const disposition = dmarc.effectivePolicySampled(
+        &rec,
+        is_subdomain,
+        g_sampling,
+        getMessageId(conn),
+    ).toString();
     addArHeaderFull(conn, result.toString(), from_domain, disposition) catch |err|
         return auth_stamp.deferCode(err, "dmarc");
 
@@ -521,6 +544,21 @@ fn countFromHeaders(conn: *connection_mod.Connection) usize {
         if (std.ascii.eqlIgnoreCase(hdr.name, "From")) count += 1;
     }
     return count;
+}
+
+/// The Message-ID this message carries, if it carries exactly one.
+///
+/// Null when absent *or* duplicated. A second Message-ID would let a sender pick
+/// which one we sample on, and RFC 5322 §3.6 allows at most one, so a message
+/// with two has no single identity to key a stable decision to (audit M-4).
+fn getMessageId(conn: *connection_mod.Connection) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (conn.headers.items) |hdr| {
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "Message-ID")) continue;
+        if (found != null) return null;
+        found = mem.trim(u8, hdr.value, &std.ascii.whitespace);
+    }
+    return found;
 }
 
 fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
@@ -740,6 +778,44 @@ test "the implicit listener binds loopback, not every interface" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "M-4: ApplyPct is off unless the config says otherwise" {
+    // The function-level guard in dmarc_test.zig proves `ignore` is inert; this
+    // proves `ignore` is what an operator who says nothing actually gets. They
+    // are different failures: shipping the wrong default would silently stop
+    // enforcing every domain still publishing pct=0, and no test of
+    // `effectivePolicySampled` would notice.
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
+    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
+
+    try std.testing.expect(!dmarc_cfg.apply_pct);
+}
+
+test "M-4: ApplyPct can be turned on" {
+    const ini_text =
+        \\[global]
+        \\AuthservID = mail.test.com
+        \\ApplyPct = yes
+    ;
+
+    var cfg = try config_mod.parse(std.testing.allocator, ini_text);
+    defer cfg.deinit();
+
+    const dmarc_cfg = try parseDmarcConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(dmarc_cfg.listen_addresses);
+    defer std.testing.allocator.free(dmarc_cfg.dns_nameservers);
+
+    try std.testing.expect(dmarc_cfg.apply_pct);
 }
 
 // A safe default, not a policy override: an operator whose Postfix runs in another

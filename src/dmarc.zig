@@ -93,6 +93,10 @@ pub const DmarcRecord = struct {
     aspf: alignment.AlignmentMode = .relaxed,
     /// Test mode (t=), RFC 9989 §4.7. Default: apply the policy as declared.
     testing: TestMode = .apply,
+    /// Sampling rate (pct=), RFC 7489 §6.6.4. Removed by RFC 9989 §A.6 and
+    /// therefore ignored unless the operator opts in; see `SamplingPolicy`.
+    /// Default 100, which is both the RFC 7489 default and a no-op.
+    pct: u8 = 100,
     /// Aggregate report URI (rua=). Informational only for milter.
     rua: ?[]const u8 = null,
     /// Forensic report URI (ruf=). Informational only for milter.
@@ -260,6 +264,20 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
             record.aspf = parseAlignmentTag(val);
         } else if (std.ascii.eqlIgnoreCase(tag, "t")) {
             record.testing = TestMode.fromString(val);
+        } else if (std.ascii.eqlIgnoreCase(tag, "pct")) {
+            // RFC 7489 §6.3: "plain-text integer between 0 and 100, inclusive;
+            // OPTIONAL; default is 100". Anything outside that -- or not a number
+            // at all -- leaves the default, which is the same "discard the tag in
+            // favour of its default" rule §4.8 applies to every other malformed
+            // value here, and is the safe direction: an unreadable pct= enforces
+            // the full policy rather than silently sampling it away.
+            //
+            // Stored whatever the operator's SamplingPolicy is. Parsing and acting
+            // are separate: a record still carrying pct= parses identically either
+            // way, so switching the option on does not change how records are read
+            // (audit M-4).
+            const n = std.fmt.parseInt(u8, val, 10) catch continue;
+            if (n <= 100) record.pct = n;
         } else if (std.ascii.eqlIgnoreCase(tag, "rua")) {
             record.rua = val;
             record.rua_valid = hasValidReportingUri(val);
@@ -330,9 +348,66 @@ pub fn alignedDkim(
     return null;
 }
 
+/// Whether a published `pct=` is honoured (audit M-4).
+///
+/// RFC 9989 §A.6 removed the tag, replacing it with `t=`, so `ignore` is the
+/// conformant reading of a current record and is the default. `honor` exists
+/// because RFC 9989 is months old and domains are still mid-transition: a domain
+/// that has published `pct=` and not yet moved to `t=` is asking for a partial
+/// rollout, and an operator may reasonably choose to give it to them. Off by
+/// default so the shipped behaviour follows the current RFC; available so an
+/// operator is not forced to break senders who have not caught up yet.
+pub const SamplingPolicy = enum { ignore, honor };
+
 /// Get the disposition action string for an A-R header reason comment.
 pub fn getDisposition(record: *const DmarcRecord, is_subdomain: bool) []const u8 {
     return effectivePolicy(record, is_subdomain).toString();
+}
+
+/// The declared policy stepped down one level.
+///
+/// Two separate mechanisms ask for exactly this and neither invented it:
+/// RFC 9989 §4.7 test mode, and RFC 7489 §6.6.4's treatment of a message the
+/// `pct=` sample did not select -- "if the email is not subject to the 'reject'
+/// policy (due to the 'pct' tag), the Mail Receiver SHOULD treat the email as
+/// though the 'quarantine' policy applies", and an unselected `quarantine`
+/// falls back to ordinary local handling, which is `none` to us.
+///
+/// One definition, two callers. Written twice, the two could drift, and the
+/// direction that matters is the unsafe one: a step-down that turned `reject`
+/// straight into `none` would hand a domain a larger downgrade than it asked
+/// for, which is the mistake §4.7 calls out by name.
+fn oneLevelDown(p: Policy) Policy {
+    return switch (p) {
+        .reject => .quarantine,
+        .quarantine => .none,
+        .none => .none,
+    };
+}
+
+/// Is this message inside the `pct=` sample?
+///
+/// RFC 7489 §6.6.4 requires only that no more than `pct` percent of affected
+/// messages have the policy enacted, and §6.3 offers `random mod 100 < pct` as
+/// "adequate". We hash the Message-ID instead, and the reason is operational
+/// rather than cryptographic: a random draw gives the *same* message a fresh
+/// verdict on every delivery attempt, so a message quarantined on the first try
+/// can walk through on the retry that follows a temporary failure. Sampling that
+/// a sender can re-roll by retrying is not a rollout control. Hashing an
+/// identifier the message carries makes the decision stable for that message
+/// while staying uniform across a mail stream, which is what §6.6.4 actually
+/// asks for -- "a close approximation to the requested percentage" and "a
+/// representative sample".
+///
+/// A message with no Message-ID is treated as selected. The alternative -- a
+/// blanket exemption -- would make omitting one header a way to opt out of a
+/// domain's enforcement, and a missing Message-ID is exactly what a bulk forger
+/// is likely to produce.
+pub fn inSample(pct: u8, message_id: ?[]const u8) bool {
+    if (pct >= 100) return true;
+    if (pct == 0) return false;
+    const id = message_id orelse return true;
+    return @as(u32, @intCast(std.hash.Wyhash.hash(0, id) % 100)) < pct;
 }
 
 /// The policy this hop should actually act on, after RFC 9989 §4.7 test mode.
@@ -355,12 +430,27 @@ pub fn effectivePolicy(record: *const DmarcRecord, is_subdomain: bool) Policy {
 
     return switch (record.testing) {
         .apply => declared,
-        .testing => switch (declared) {
-            .reject => .quarantine,
-            .quarantine => .none,
-            .none => .none,
-        },
+        .testing => oneLevelDown(declared),
     };
+}
+
+/// `effectivePolicy`, then the `pct=` sample if the operator honours it (M-4).
+///
+/// Applied after test mode rather than before, because the two are independent
+/// statements by the Domain Owner and both are reductions: `t=y` says "I am not
+/// ready to enforce this at all", `pct=` says "enforce it on this fraction".
+/// A domain publishing both means each, and composing them can only ever step
+/// further down, never back up.
+pub fn effectivePolicySampled(
+    record: *const DmarcRecord,
+    is_subdomain: bool,
+    sampling: SamplingPolicy,
+    message_id: ?[]const u8,
+) Policy {
+    const p = effectivePolicy(record, is_subdomain);
+    if (sampling == .ignore) return p;
+    if (inSample(record.pct, message_id)) return p;
+    return oneLevelDown(p);
 }
 
 fn parseAlignmentTag(val: []const u8) alignment.AlignmentMode {
