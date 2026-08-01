@@ -21,6 +21,7 @@ const Psd = dmarc.Psd;
 const Result = dmarc.Result;
 const TestMode = dmarc.TestMode;
 
+const alignedDkim = dmarc.alignedDkim;
 const effectivePolicy = dmarc.effectivePolicy;
 const evaluate = dmarc.evaluate;
 const getDisposition = dmarc.getDisposition;
@@ -207,6 +208,62 @@ test "evaluate pass with DKIM aligned" {
         .result = "pass",
     };
     try std.testing.expectEqual(Result.pass, evaluate(&record, "example.com", "example.com", spf, &.{dkim}));
+}
+
+test "D-11: a testing-key DKIM pass does not carry DMARC, however well aligned" {
+    // Identical to "evaluate pass with DKIM aligned" in every respect except the
+    // testing flag, so the flag is demonstrably the only thing deciding it.
+    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
+    const spf = alignment.Identifier{
+        .domain = "other.com",
+        .org_domain = "other.com",
+        .result = "fail",
+    };
+    const dkim = alignment.Identifier{
+        .domain = "example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+        .testing = true,
+    };
+
+    // RFC 6376 §3.6.1: a testing key must not be treated differently from
+    // unsigned email. Unsigned mail with a failing SPF fails DMARC, so this must
+    // too -- otherwise publishing `t=y` buys a domain a better outcome than
+    // publishing nothing, which is exactly backwards.
+    try std.testing.expectEqual(Result.fail, evaluate(&record, "example.com", "example.com", spf, &.{dkim}));
+
+    // And it must not be nominated as the signature the verdict rests on.
+    try std.testing.expect(alignedDkim(&record, "example.com", "example.com", &.{dkim}) == null);
+}
+
+test "D-11: a real signature still carries DMARC alongside a testing one" {
+    // The guard, and the ordering trap: the testing signature comes FIRST, so an
+    // implementation that let the first identifier decide -- or that stopped
+    // scanning at the first `pass` without checking the flag -- would fail this.
+    const record = DmarcRecord{ .policy = .reject, .aspf = .relaxed, .adkim = .relaxed };
+    const spf = alignment.Identifier{ .domain = "other.com", .org_domain = "other.com", .result = "fail" };
+    const testing_sig = alignment.Identifier{
+        .domain = "example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+        .testing = true,
+    };
+    const real_sig = alignment.Identifier{
+        .domain = "example.com",
+        .org_domain = "example.com",
+        .result = "pass",
+    };
+
+    try std.testing.expectEqual(
+        Result.pass,
+        evaluate(&record, "example.com", "example.com", spf, &.{ testing_sig, real_sig }),
+    );
+
+    // The reported signature must be the real one, not the testing one that
+    // happened to be scanned first (the M-6 reporting rule).
+    const chosen = alignedDkim(&record, "example.com", "example.com", &.{ testing_sig, real_sig });
+    try std.testing.expect(chosen != null);
+    try std.testing.expect(!chosen.?.testing);
 }
 
 test "evaluate fail neither aligned" {
