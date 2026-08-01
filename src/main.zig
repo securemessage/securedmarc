@@ -42,6 +42,15 @@ pub const DmarcConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
+    /// Per-worker cap on simultaneous connections, enforced in the accept path.
+    ///
+    /// No default on this field on purpose. It reached the worker as a hard-coded
+    /// `DEFAULT_MAX_CONNECTIONS` while `MaxConnections` was already read by
+    /// `securespf`, so the same key was honoured by one daemon and silently ignored
+    /// by this one (audit L-2). A field that quietly supplies a constant when the
+    /// caller forgets to set it is how that happens, so every construction site
+    /// states it.
+    max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
     user: ?[]const u8,
@@ -118,6 +127,12 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
 
     const authserv_id = global.get("AuthservID") orelse "localhost";
     const workers = global.getInt("WorkerThreads", u32, 0);
+
+    // Read beside `WorkerThreads` because the two are multiplied: `calculateFdNeed`
+    // sizes the RLIMIT_NOFILE raise as workers x (max_connections + listeners + 3),
+    // so raising either one alone is not the whole change.
+    const max_connections = global.getInt("MaxConnections", u32, worker_mod.DEFAULT_MAX_CONNECTIONS);
+
     const pid_file = global.getOrDefault("PidFile", "/var/run/securedmarc/securedmarc.pid");
     const foreground_val = global.getBool("Foreground", false);
     const user = global.get("User");
@@ -181,6 +196,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .authserv_id = authserv_id,
         .listen_addresses = try addrs.toOwnedSlice(allocator),
         .worker_threads = workers,
+        .max_connections = max_connections,
         .pid_file = pid_file,
         .foreground = foreground_val,
         .user = user,
@@ -280,7 +296,7 @@ fn runDaemon() !void {
         .pid_file = dmarc_cfg.pid_file,
         .user = dmarc_cfg.user,
         .worker_threads = dmarc_cfg.worker_threads,
-        .max_connections = worker_mod.DEFAULT_MAX_CONNECTIONS,
+        .max_connections = dmarc_cfg.max_connections,
         .num_listeners = @intCast(dmarc_cfg.listen_addresses.len),
         .spawn_threads = spawnHealthMonitor,
     });
@@ -310,7 +326,7 @@ fn runDaemon() !void {
         callbacks,
         shutdown_pipe[0],
         &g_config_gen,
-        worker_mod.DEFAULT_MAX_CONNECTIONS,
+        dmarc_cfg.max_connections,
     );
     defer threads.deinit(allocator);
 
@@ -799,6 +815,42 @@ test "a listener section with no Socket is refused" {
     defer cfg.deinit();
 
     try std.testing.expectError(error.MissingListenerSocket, parseDmarcConfig(std.testing.allocator, &cfg));
+}
+
+// L-2: `MaxConnections` was read by `securespf` and ignored here, so an operator
+// who set it on this daemon got 256 and no diagnostic. The value has two
+// consumers -- the accept-path cap and the RLIMIT_NOFILE calculation -- and
+// wiring only one of them would raise the fd budget without raising the limit
+// that budget was sized for, or the reverse.
+test "L-2: MaxConnections is honoured, and defaults when absent" {
+    {
+        var cfg = try config_mod.parse(std.testing.allocator,
+            \\[global]
+            \\AuthservID = mail.test.com
+            \\MaxConnections = 32
+        );
+        defer cfg.deinit();
+
+        const parsed = try parseDmarcConfig(std.testing.allocator, &cfg);
+        defer std.testing.allocator.free(parsed.listen_addresses);
+        defer std.testing.allocator.free(parsed.dns_nameservers);
+
+        try std.testing.expectEqual(@as(u32, 32), parsed.max_connections);
+    }
+
+    {
+        var cfg = try config_mod.parse(std.testing.allocator,
+            \\[global]
+            \\AuthservID = mail.test.com
+        );
+        defer cfg.deinit();
+
+        const parsed = try parseDmarcConfig(std.testing.allocator, &cfg);
+        defer std.testing.allocator.free(parsed.listen_addresses);
+        defer std.testing.allocator.free(parsed.dns_nameservers);
+
+        try std.testing.expectEqual(worker_mod.DEFAULT_MAX_CONNECTIONS, parsed.max_connections);
+    }
 }
 
 // The implicit listener binds loopback, never 0.0.0.0.
