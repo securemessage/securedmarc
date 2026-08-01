@@ -494,7 +494,12 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
     }
 
     // Step 5: Evaluate alignment
-    const result = dmarc.evaluate(&rec, from_domain, from_org, spf_ident, dkim_idents);
+    //
+    // The detailed form keeps the two alignment booleans the verdict was built
+    // from, which the reporting event has to state and cannot safely re-derive
+    // (audit M-7a).
+    const evaluation = dmarc.evaluateDetailed(&rec, from_domain, from_org, spf_ident, dkim_idents);
+    const result = evaluation.result;
 
     // Report the signature the verdict actually rests on: the aligned one when
     // there is one, otherwise the first, so a `dkim=pass` in the event is never
@@ -515,16 +520,20 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
         return auth_stamp.deferCode(err, "dmarc");
 
     // Publish ZMQ event with full evaluation details
-    publishEvent(
-        conn.allocator,
-        from_domain,
-        result.toString(),
-        disposition,
-        spf_result orelse "none",
-        reported_dkim.result orelse "none",
-        reported_dkim.domain orelse "",
-        envelope_domain orelse "",
-    );
+    publishEvent(conn.allocator, .{
+        .client_ip = conn.macros.client_addr orelse "",
+        .from_domain = from_domain,
+        .header_from = getFromAddress(conn) orelse "",
+        .envelope_from = envelope_domain orelse "",
+        .policy = dmarc.publishedPolicy(&rec, is_subdomain).toString(),
+        .disposition = disposition,
+        .dmarc_result = result.toString(),
+        .spf_result = spf_result orelse "none",
+        .spf_aligned = evaluation.spf_aligned,
+        .dkim_result = reported_dkim.result orelse "none",
+        .dkim_domain = reported_dkim.domain orelse "",
+        .dkim_aligned = evaluation.dkim_aligned,
+    });
 
     return @intFromEnum(responses.Code.@"continue");
 }
@@ -561,7 +570,12 @@ fn getMessageId(conn: *connection_mod.Connection) ?[]const u8 {
     return found;
 }
 
-fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
+/// The address in the `From` header, without any display name.
+///
+/// Split out from `getFromDomain` so the reporting event can state the full
+/// address RFC 7489 §7.2 asks for without a second, possibly divergent, parse of
+/// the same header (audit M-7a).
+fn getFromAddress(conn: *connection_mod.Connection) ?[]const u8 {
     for (conn.headers.items) |hdr| {
         if (std.ascii.eqlIgnoreCase(hdr.name, "From")) {
             // Extract email address from From: header value
@@ -569,13 +583,17 @@ fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
             const val = mem.trim(u8, hdr.value, &std.ascii.whitespace);
             if (mem.lastIndexOfScalar(u8, val, '>')) |gt| {
                 if (mem.lastIndexOfScalar(u8, val[0..gt], '<')) |lt| {
-                    return alignment.getDomainFromEmail(val[lt + 1 .. gt]);
+                    return val[lt + 1 .. gt];
                 }
             }
-            return alignment.getDomainFromEmail(val);
+            return val;
         }
     }
     return null;
+}
+
+fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
+    return alignment.getDomainFromEmail(getFromAddress(conn) orelse return null);
 }
 
 fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
@@ -584,35 +602,68 @@ fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
     return alignment.getDomainFromEmail(addr);
 }
 
-fn publishEvent(
-    allocator: Allocator,
+/// One DMARC evaluation, as the future `securedmarc-reporter` needs to see it.
+///
+/// The field set is the one the suite plan specifies, which in turn is what
+/// RFC 7489 §7.2 requires of an aggregate report row. Five of these used to be
+/// absent (audit M-7a). `client_ip` was the one that mattered: it is mandatory on
+/// every `<record><row>` and it is the only field here that a subscriber cannot
+/// reconstruct after the fact, because the connecting address is known to the
+/// milter and to nothing downstream of it.
+const Event = struct {
+    client_ip: []const u8,
     from_domain: []const u8,
-    result_str: []const u8,
-    disposition: []const u8,
-    spf_result_str: []const u8,
-    dkim_result_str: []const u8,
-    dkim_domain_str: []const u8,
+    header_from: []const u8,
     envelope_from: []const u8,
-) void {
-    // `from_domain`, `dkim_domain_str` and `envelope_from` all originate in the
-    // message or its envelope, so each is sender-chosen; the three result strings
-    // and the disposition are ours. A `"` in any sender-chosen value used to end
-    // its JSON string early and leave the rest of the payload to be reinterpreted
-    // by the consumer (audit X-5).
-    const json = std.fmt.allocPrint(allocator,
-        \\{{"from_domain":"{f}","result":"{s}","disposition":"{s}","spf_result":"{s}","dkim_result":"{s}","dkim_domain":"{f}","envelope_from":"{f}"}}
-    , .{
-        escape.jsonString(from_domain),
-        result_str,
-        disposition,
-        spf_result_str,
-        dkim_result_str,
-        escape.jsonString(dkim_domain_str),
-        escape.jsonString(envelope_from),
-    }) catch return;
+    /// What the Domain Owner published, before `t=y` or `pct=` reduced it.
+    policy: []const u8,
+    /// What we actually applied, after those reductions.
+    disposition: []const u8,
+    dmarc_result: []const u8,
+    spf_result: []const u8,
+    spf_aligned: bool,
+    dkim_result: []const u8,
+    dkim_domain: []const u8,
+    dkim_aligned: bool,
+};
+
+fn publishEvent(allocator: Allocator, ev: Event) void {
+    const json = formatEvent(allocator, ev) catch return;
     defer allocator.free(json);
 
     getPublisher().publish(json);
+}
+
+/// Serialize one event.
+///
+/// Separate from `publishEvent` so the payload can be asserted on without a ZMQ
+/// socket: the field set is a contract with a consumer that does not exist yet,
+/// which is exactly the kind of thing that silently rots if nothing checks it.
+fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
+    // `from_domain`, `header_from`, `dkim_domain` and `envelope_from` all
+    // originate in the message or its envelope, so each is sender-chosen; the
+    // results, the policy and the disposition are ours, and `client_ip` comes
+    // from the MTA rather than the message. A `"` in any sender-chosen value used
+    // to end its JSON string early and leave the rest of the payload to be
+    // reinterpreted by the consumer (audit X-5), so every value that did not
+    // originate here is escaped — `client_ip` included, since a value being
+    // trustworthy today is not a reason for the payload to depend on it.
+    return std.fmt.allocPrint(allocator,
+        \\{{"client_ip":"{f}","from_domain":"{f}","header_from":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
+    , .{
+        escape.jsonString(ev.client_ip),
+        escape.jsonString(ev.from_domain),
+        escape.jsonString(ev.header_from),
+        escape.jsonString(ev.envelope_from),
+        ev.policy,
+        ev.disposition,
+        ev.dmarc_result,
+        ev.spf_result,
+        if (ev.spf_aligned) "true" else "false",
+        ev.dkim_result,
+        escape.jsonString(ev.dkim_domain),
+        if (ev.dkim_aligned) "true" else "false",
+    });
 }
 
 /// Record the DMARC result on the message.
@@ -778,6 +829,109 @@ test "the implicit listener binds loopback, not every interface" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "M-7a: the event carries every field an aggregate report row needs" {
+    // The consumer does not exist yet, so nothing else would notice a field going
+    // missing until the reporter was written and found the data unrecoverable.
+    // `client_ip` is the one that cannot be backfilled: it is mandatory on every
+    // RFC 7489 §7.2 `<record><row>` and only the milter ever sees it.
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .from_domain = "example.com",
+        .header_from = "sender@example.com",
+        .envelope_from = "bounce@example.com",
+        .policy = "reject",
+        .disposition = "quarantine",
+        .dmarc_result = "fail",
+        .spf_result = "pass",
+        .spf_aligned = false,
+        .dkim_result = "pass",
+        .dkim_domain = "example.com",
+        .dkim_aligned = true,
+    });
+    defer std.testing.allocator.free(json);
+
+    for ([_][]const u8{
+        "\"client_ip\":\"203.0.113.42\"",
+        "\"header_from\":\"sender@example.com\"",
+        "\"envelope_from\":\"bounce@example.com\"",
+        "\"policy\":\"reject\"",
+        "\"disposition\":\"quarantine\"",
+        "\"dmarc_result\":\"fail\"",
+        "\"spf_aligned\":false",
+        "\"dkim_aligned\":true",
+    }) |needle| {
+        if (mem.indexOf(u8, json, needle) == null) {
+            std.debug.print("event payload missing {s}\ngot: {s}\n", .{ needle, json });
+            return error.TestFailed;
+        }
+    }
+}
+
+test "M-7a: the published policy and the applied disposition are reported separately" {
+    // A domain mid-rollout publishes `p=reject` and gets `quarantine` applied.
+    // Reporting only one of the two would make it indistinguishable, in the
+    // aggregate report, from a domain that asked for `quarantine` outright -- so
+    // the Domain Owner could not tell their own rollout was in effect.
+    var record = dmarc.DmarcRecord{ .policy = .reject, .testing = .testing };
+
+    const published = dmarc.publishedPolicy(&record, false);
+    const applied = dmarc.effectivePolicySampled(&record, false, .ignore, null);
+
+    try std.testing.expectEqualStrings("reject", published.toString());
+    try std.testing.expectEqualStrings("quarantine", applied.toString());
+
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .from_domain = "example.com",
+        .header_from = "sender@example.com",
+        .envelope_from = "sender@example.com",
+        .policy = published.toString(),
+        .disposition = applied.toString(),
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"reject\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"disposition\":\"quarantine\"") != null);
+}
+
+test "M-7a: a quote in a sender-chosen field cannot break the payload" {
+    // header_from is taken from the message, so it is chosen by whoever sent it.
+    // Unescaped, the `"` would close the string and hand the rest of the object to
+    // the sender to redefine -- X-5, in a new field.
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .from_domain = "example.com",
+        .header_from = "a\",\"policy\":\"none\",\"x\":\"b@example.com",
+        .envelope_from = "sender@example.com",
+        .policy = "reject",
+        .disposition = "reject",
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    // The injected `"policy":"none"` must not appear as a structural member.
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"none\"") == null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"reject\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "reject",
+        parsed.value.object.get("policy").?.string,
+    );
 }
 
 test "M-4: ApplyPct is off unless the config says otherwise" {

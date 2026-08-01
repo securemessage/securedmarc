@@ -313,6 +313,35 @@ pub fn evaluate(
     spf: alignment.Identifier,
     dkim: []const alignment.Identifier,
 ) Result {
+    return evaluateDetailed(record, from_domain, from_org_domain, spf, dkim).result;
+}
+
+/// A DMARC verdict together with the two alignment facts it rests on.
+///
+/// RFC 7489 §7.2's `<policy_evaluated>` carries the SPF and DKIM alignment
+/// outcomes as separate elements from the disposition, so an aggregate report
+/// cannot be produced from the verdict alone. Both were already computed here
+/// and discarded, which left the reporting event unable to state them (audit
+/// M-7a).
+pub const Evaluation = struct {
+    result: Result,
+    spf_aligned: bool,
+    dkim_aligned: bool,
+};
+
+/// `evaluate`, keeping the alignment facts instead of reducing them to pass/fail.
+///
+/// Returned rather than left to the caller to re-derive, for the same reason
+/// `alignedDkim` returns the identifier: a second independent scan can reach a
+/// different conclusion than the one the verdict was built on, which is the M-6
+/// defect exactly. One computation, one set of facts.
+pub fn evaluateDetailed(
+    record: *const DmarcRecord,
+    from_domain: []const u8,
+    from_org_domain: []const u8,
+    spf: alignment.Identifier,
+    dkim: []const alignment.Identifier,
+) Evaluation {
     const spf_aligned = spf.passed() and
         alignment.isAligned(from_domain, from_org_domain, spf, record.aspf);
 
@@ -321,7 +350,11 @@ pub fn evaluate(
     // Pass if either mechanism is aligned. The DMARC *result* is "fail"
     // otherwise, regardless of policy: the policy determines the action the
     // MTA takes, not the result value in the A-R header.
-    return if (spf_aligned or dkim_aligned) .pass else .fail;
+    return .{
+        .result = if (spf_aligned or dkim_aligned) .pass else .fail,
+        .spf_aligned = spf_aligned,
+        .dkim_aligned = dkim_aligned,
+    };
 }
 
 /// The first verified DKIM identifier that aligns with the Author Domain.
@@ -423,15 +456,27 @@ pub fn inSample(pct: u8, message_id: ?[]const u8) bool {
 /// `dmarc=` value in `Authentication-Results` is what a downstream consumer
 /// and any future reporter read.
 pub fn effectivePolicy(record: *const DmarcRecord, is_subdomain: bool) Policy {
-    const declared = if (is_subdomain)
-        record.getSubdomainPolicy()
-    else
-        record.policy;
+    const declared = publishedPolicy(record, is_subdomain);
 
     return switch (record.testing) {
         .apply => declared,
         .testing => oneLevelDown(declared),
     };
+}
+
+/// The policy the Domain Owner actually published for this message, before any
+/// reduction this receiver applies.
+///
+/// Distinct from `effectivePolicy` because RFC 7489 §7.2 reports the two
+/// separately: `<policy_published>` states what the domain asked for, while
+/// `<policy_evaluated><disposition>` states what we did. Collapsing them would
+/// make a domain's `t=y` or `pct=` rollout indistinguishable, in the report, from
+/// a domain that never asked for enforcement at all (audit M-7a).
+pub fn publishedPolicy(record: *const DmarcRecord, is_subdomain: bool) Policy {
+    return if (is_subdomain)
+        record.getSubdomainPolicy()
+    else
+        record.policy;
 }
 
 /// `effectivePolicy`, then the `pct=` sample if the operator honours it (M-4).
