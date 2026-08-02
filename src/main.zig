@@ -369,7 +369,11 @@ fn onEom(conn: *connection_mod.Connection) u8 {
     const result = doDmarcEvaluation(conn);
     const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
     const queue_id = conn.macros.queue_id orelse "-";
-    const client_addr = conn.macros.client_addr orelse "unknown";
+    // Via the accessor, not the macro: {client_addr} is absent from Postfix's
+    // default milter_connect_macros, so reading it directly logs "unknown" for
+    // every connection on a stock MTA. The accessor falls back to the address
+    // SMFIC_CONNECT carried. Here the placeholder is display-only.
+    const client_addr = conn.clientAddr() orelse "unknown";
     const from_domain = getFromDomain(conn) orelse "unknown";
     const peer = conn.getPeerDisplay();
     // `domain` here is taken from the message's own `From:` field, which is
@@ -537,7 +541,11 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
 
     // Publish ZMQ event with full evaluation details
     publishEvent(conn.allocator, .{
-        .client_ip = conn.macros.client_addr orelse "",
+        // Via the accessor so this is populated on a stock MTA, where the
+        // {client_addr} macro is not sent. An empty value here is not cosmetic:
+        // client_ip is mandatory on every RFC 7489 SS7.2 <record><row>, so an
+        // event without it cannot become a valid aggregate report row.
+        .client_ip = conn.clientAddr() orelse "",
         .from_domain = from_domain,
         .header_from = getFromAddress(conn) orelse "",
         .envelope_from = envelope_domain orelse "",
