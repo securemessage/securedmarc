@@ -546,8 +546,8 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection) u8 {
         // client_ip is mandatory on every RFC 7489 SS7.2 <record><row>, so an
         // event without it cannot become a valid aggregate report row.
         .client_ip = conn.clientAddr() orelse "",
-        .from_domain = from_domain,
-        .header_from = getFromAddress(conn) orelse "",
+        .header_from = from_domain,
+        .from_address = getFromAddress(conn) orelse "",
         .envelope_from = envelope_domain orelse "",
         .policy = dmarc.publishedPolicy(&rec, is_subdomain).toString(),
         .disposition = disposition,
@@ -636,8 +636,27 @@ fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
 /// milter and to nothing downstream of it.
 const Event = struct {
     client_ip: []const u8,
-    from_domain: []const u8,
+
+    /// The RFC5322.From **domain**, which is what an aggregate report's
+    /// `<header_from>` holds: RFC 9990 SS3.1.1.10 and RFC 7489 Appendix C both
+    /// define the element as "the RFC5322.From domain from the message".
+    ///
+    /// It held the full mailbox until 2026-08-02, which made the one field a
+    /// reporter can copy straight into the XML the one field it must not. The
+    /// name is the report's, so it carries the report's meaning; the mailbox is
+    /// next door under a name the RFC does not use for anything.
     header_from: []const u8,
+
+    /// The whole RFC5322.From mailbox, local-part included.
+    ///
+    /// Ours, not an aggregate-report field -- DMARC authenticates a domain and
+    /// RFC 7489 SS1 is explicit that it "does not authenticate the local-part".
+    /// Kept because it is useful for forensics and for operators reading the
+    /// event stream directly, and deliberately not named `header_from`.
+    from_address: []const u8,
+
+    /// The RFC5321.MailFrom **domain** (RFC 9990 SS3.1.1.10), matching
+    /// `header_from` in granularity rather than the mailbox above.
     envelope_from: []const u8,
     /// What the Domain Owner published, before `t=y` or `pct=` reduced it.
     policy: []const u8,
@@ -664,7 +683,7 @@ fn publishEvent(allocator: Allocator, ev: Event) void {
 /// socket: the field set is a contract with a consumer that does not exist yet,
 /// which is exactly the kind of thing that silently rots if nothing checks it.
 fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
-    // `from_domain`, `header_from`, `dkim_domain` and `envelope_from` all
+    // `header_from`, `from_address`, `dkim_domain` and `envelope_from` all
     // originate in the message or its envelope, so each is sender-chosen; the
     // results, the policy and the disposition are ours, and `client_ip` comes
     // from the MTA rather than the message. A `"` in any sender-chosen value used
@@ -673,11 +692,11 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
     // originate here is escaped — `client_ip` included, since a value being
     // trustworthy today is not a reason for the payload to depend on it.
     return std.fmt.allocPrint(allocator,
-        \\{{"client_ip":"{f}","from_domain":"{f}","header_from":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
+        \\{{"client_ip":"{f}","header_from":"{f}","from_address":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
     , .{
         escape.jsonString(ev.client_ip),
-        escape.jsonString(ev.from_domain),
         escape.jsonString(ev.header_from),
+        escape.jsonString(ev.from_address),
         escape.jsonString(ev.envelope_from),
         ev.policy,
         ev.disposition,
@@ -898,9 +917,9 @@ test "M-7a: the event carries every field an aggregate report row needs" {
     // RFC 7489 §7.2 `<record><row>` and only the milter ever sees it.
     const json = try formatEvent(std.testing.allocator, .{
         .client_ip = "203.0.113.42",
-        .from_domain = "example.com",
-        .header_from = "sender@example.com",
-        .envelope_from = "bounce@example.com",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "bounce.example.com",
         .policy = "reject",
         .disposition = "quarantine",
         .dmarc_result = "fail",
@@ -914,8 +933,15 @@ test "M-7a: the event carries every field an aggregate report row needs" {
 
     for ([_][]const u8{
         "\"client_ip\":\"203.0.113.42\"",
-        "\"header_from\":\"sender@example.com\"",
-        "\"envelope_from\":\"bounce@example.com\"",
+        // A *domain*, and the fixture says so. RFC 9990 SS3.1.1.10 defines the
+        // report element of this name as "the RFC5322.From domain from the
+        // message", so a reporter copies this field straight into
+        // `<identifiers><header_from>`. It carried `sender@example.com` until
+        // 2026-08-02, which would have put a local-part into every report row
+        // -- data DMARC does not authenticate and the schema does not describe.
+        "\"header_from\":\"example.com\"",
+        "\"from_address\":\"sender@example.com\"",
+        "\"envelope_from\":\"bounce.example.com\"",
         "\"policy\":\"reject\"",
         "\"disposition\":\"quarantine\"",
         "\"dmarc_result\":\"fail\"",
@@ -944,9 +970,9 @@ test "M-7a: the published policy and the applied disposition are reported separa
 
     const json = try formatEvent(std.testing.allocator, .{
         .client_ip = "203.0.113.42",
-        .from_domain = "example.com",
-        .header_from = "sender@example.com",
-        .envelope_from = "sender@example.com",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "example.com",
         .policy = published.toString(),
         .disposition = applied.toString(),
         .dmarc_result = "fail",
@@ -963,14 +989,14 @@ test "M-7a: the published policy and the applied disposition are reported separa
 }
 
 test "M-7a: a quote in a sender-chosen field cannot break the payload" {
-    // header_from is taken from the message, so it is chosen by whoever sent it.
+    // from_address is taken from the message, so it is chosen by whoever sent it.
     // Unescaped, the `"` would close the string and hand the rest of the object to
     // the sender to redefine -- X-5, in a new field.
     const json = try formatEvent(std.testing.allocator, .{
         .client_ip = "203.0.113.42",
-        .from_domain = "example.com",
-        .header_from = "a\",\"policy\":\"none\",\"x\":\"b@example.com",
-        .envelope_from = "sender@example.com",
+        .header_from = "example.com",
+        .from_address = "a\",\"policy\":\"none\",\"x\":\"b@example.com",
+        .envelope_from = "example.com",
         .policy = "reject",
         .disposition = "reject",
         .dmarc_result = "fail",
