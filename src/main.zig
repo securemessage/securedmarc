@@ -707,7 +707,7 @@ fn addArHeaderSimple(conn: *connection_mod.Connection, result_str: []const u8, r
             .reason = reason,
             .properties = &.{},
         },
-    });
+    }, conn.negotiated_protocol.header_leading_space);
 }
 
 fn addArHeaderFull(
@@ -730,7 +730,7 @@ fn addArHeaderFull(
                 .value = from_domain,
             }},
         },
-    });
+    }, conn.negotiated_protocol.header_leading_space);
 }
 
 fn dupeOrNull(allocator: Allocator, s: []const u8) ?[]const u8 {
