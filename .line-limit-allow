@@ -87,6 +87,63 @@
 #   NOT PAID DOWN HERE ON PURPOSE, same as the X-16(b) note above: these files are the
 #   roadmap's settings.zig extraction target and should be cut there, not nibbled here.
 
+# 2026-08-04, STAGE 4.2: main.zig 784 -> 284 AND OFF THIS LIST ENTIRELY.
+#
+#   The extraction the note directly above deferred to ("the roadmap's
+#   settings.zig extraction target ... should be cut there, not nibbled here").
+#   main.zig is now under the 400 goal with no ceiling at all, which is the
+#   first daemon main to get there.
+#
+#     settings.zig  140   DmarcConfig and parseDmarcConfig, and the 8 config tests
+#     flow.zig      455   onEom, the evaluation, the event, the A-R stamps, 5 tests
+#     main.zig      284   globals, bootstrap, reload, and two wrappers
+#
+#   THE SPLIT COST +95 LINES OVERALL: 784 became 879 across three files. Two
+#   module headers, two import blocks and the `MsgCtx` declaration with its
+#   reasoning. Stated because the plan's estimate (~250 + ~200 + ~300) implied a
+#   reduction and there was none -- the win is that no file is now over 455, not
+#   that there is less code.
+#
+#   FUNCTIONS 78 -> 79. `msgCtx` gathers the globals; `onEom` stays in main.zig
+#   as a wrapper over `flow.doEom` because `worker.Callbacks.on_eom` is a bare
+#   function pointer and cannot carry a context. Against those two, `dupeOrNull`
+#   is DELETED: it had no call site anywhere in the repo. It was ALREADY DEAD AT
+#   HEAD -- its last caller went in `328c27c` (M-6) -- so it is removed here as
+#   cleanup, not claimed as a result of this pass. `listener_mod`, `auth_results`,
+#   `auth_stamp`, `escape`, `codec` and `responses` went with the moved code.
+#
+#   flow.MsgCtx HOLDS ACCESSORS for the resolver and publisher, not pointers,
+#   and that is a deliberate divergence from securearc. Both providers here
+#   lazily construct a threadlocal on first call -- the resolver builds a TTL
+#   cache, the publisher opens a ZMQ socket. A message can finish before either
+#   is wanted: a second `From` field, no `From` domain, or no DMARC record each
+#   return before the publish, and the first two before any DNS. Eager fields
+#   would construct both on every worker that ever saw a message, which is a
+#   behaviour change and not one to smuggle into a file move. `psl` IS held
+#   directly -- it is loaded once at startup and `reloadConfig` refuses to swap
+#   it under running workers, so the pointer cannot go stale. Same reasoning,
+#   and the same split, as securespf and securedkim.
+#
+# 2026-08-04, dmarc.zig 511. PRE-EXISTING, EXAMINED, AND ACCEPTED ON ITS MERITS.
+#
+#   Not caused by the split above and not a file this stage touched. It crossed
+#   the goal at `78d8acc` (M-4, honouring `pct=`, 376 -> 466) and reached 511 at
+#   `177164c` (M-7a, the aggregate-report event fields). Both are audit
+#   remediation that added rules, so the growth is work rather than accretion --
+#   established from the history before writing this, not assumed.
+#
+#   Its shape argues against splitting: `parseRecord` is 102 lines and every
+#   other function is 34 or less -- hasValidReportingUri, evaluateDetailed,
+#   evaluate, oneLevelDown, alignedDkim, inSample, getDisposition,
+#   effectivePolicy, publishedPolicy. That is one record parser and the small
+#   policy helpers that interpret what it parsed, all of them RFC 9989 clauses.
+#   Cutting between them would separate a rule from the record it reads, which
+#   is the reason the plan gives for leaving securearc/src/chain.zig whole.
+#
+#   Verified unchanged across the split: unit 76/76 (identical to the baseline
+#   measured before any edit, so no test was lost in the move) and the RFC 9989
+#   suite 28/28.
+
 # WRITE THE REASON FOR A CEILING ABOVE THIS LINE.
 #
 # From here down is regenerated whenever a ceiling moves. A comment
@@ -99,4 +156,5 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-652 src/main.zig
+511 src/dmarc.zig
+455 src/flow.zig

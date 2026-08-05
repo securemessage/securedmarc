@@ -1,0 +1,605 @@
+//! SecureDMARC message flow: everything that runs per message.
+//!
+//! Split out of `main.zig` at stage 4.2, matching `securearc` and the split
+//! `securedkim` took at 4.1. `main.zig` keeps the globals, the bootstrap and
+//! the reload; this file evaluates a message and stamps the verdict on it.
+
+const std = @import("std");
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const securemilter = @import("securemilter");
+const connection_mod = securemilter.connection;
+const auth_stamp = securemilter.auth_stamp;
+const escape = securemilter.escape;
+const responses = securemilter.milter.responses;
+const header_scrub = securemilter.header_scrub;
+const dns_mod = securemilter.dns;
+const zmq = securemilter.zmq;
+const log = securemilter.log;
+
+const dmarc = @import("dmarc.zig");
+const alignment = @import("alignment.zig");
+const treewalk = @import("treewalk.zig");
+const psl = @import("psl.zig");
+const upstream = @import("upstream.zig");
+
+/// What the flow reads from the daemon's configuration, gathered once per message.
+///
+/// `main.zig` owns the globals these come from and sets them all before the
+/// worker pool spawns. Collecting them at one point per message is what keeps
+/// the flow from reading module state at a dozen scattered places, where a
+/// reload landing mid-message could have shown it two different configurations.
+pub const MsgCtx = struct {
+    authserv_id: []const u8,
+    strip_policy: header_scrub.StripPolicy,
+    sampling: dmarc.SamplingPolicy,
+    /// Loaded once at startup and read-only for the life of the process -- see
+    /// `reloadConfig`, which explicitly refuses to swap it under running
+    /// workers -- so carrying the pointer is safe. Null when none is configured.
+    psl: ?*const psl.PublicSuffixList,
+
+    /// ACCESSORS, NOT POINTERS, and deliberately so.
+    ///
+    /// Both providers in `main.zig` lazily construct a threadlocal on first
+    /// call: the resolver builds a TTL cache, the publisher opens a ZMQ socket.
+    /// A message can finish before either is wanted -- a second `From` field, a
+    /// missing `From` domain, or no DMARC record at all each return before the
+    /// publish, and the first two before any DNS. Holding them as fields would
+    /// mean constructing both on every worker that ever saw a message, which is
+    /// a behaviour change and not one worth smuggling into a file move. Same
+    /// choice, for the same reason, as `securespf` and `securedkim`.
+    resolver: *const fn () *dns_mod.Resolver,
+    publisher: *const fn () *zmq.Publisher,
+};
+
+/// How many DKIM results from `Authentication-Results` are evaluated.
+///
+/// Every relaxed-mode identifier that passed can cost one DNS tree walk, and
+/// the number of `dkim=` results in the header is chosen by whoever sent the
+/// message. The cap is the same reasoning as the other content limits (audit
+/// X-4): bound work that an attacker gets to size. Ten is far above what real
+/// mail carries — a message with more aligned candidates than this is not one
+/// whose eleventh signature decides the verdict.
+const MAX_DKIM_IDENTIFIERS = 10;
+
+/// End-of-message: scrub forged claims, evaluate, and log the verdict.
+pub fn doEom(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
+    const start_ns = std.time.nanoTimestamp();
+
+    // Drop forged dmarc= claims before evaluating. The spf= and dkim= results
+    // this evaluation consumes were scrubbed of forgeries by SecureSPF and
+    // SecureDKIM earlier in the chain; what survives here was produced by them.
+    _ = header_scrub.stripAuthResults(conn, ctx.authserv_id, ctx.strip_policy);
+
+    const result = doDmarcEvaluation(conn, ctx);
+    const elapsed_ms = @divFloor(std.time.nanoTimestamp() - start_ns, 1_000_000);
+    const queue_id = conn.macros.queue_id orelse "-";
+    // Via the accessor, not the macro: {client_addr} is absent from Postfix's
+    // default milter_connect_macros, so reading it directly logs "unknown" for
+    // every connection on a stock MTA. The accessor falls back to the address
+    // SMFIC_CONNECT carried. Here the placeholder is display-only.
+    const client_addr = conn.clientAddr() orelse "unknown";
+    const from_domain = getFromDomain(conn) orelse "unknown";
+    const peer = conn.getPeerDisplay();
+    // `domain` here is taken from the message's own `From:` field, which is
+    // entirely sender-chosen and may be folded across lines -- so its unfolded
+    // value can begin with whitespace or contain a bare LF. Unescaped, that
+    // either forged a second syslog line or made `elapsed=` look like this
+    // field's value. This is the field the x5a probe reported (audit X-5).
+    log.info("id={f} peer={f}[{f}] client={f} domain={f} elapsed={d}ms", .{
+        escape.logField(queue_id),
+        escape.logField(peer.name),
+        escape.logField(peer.ip),
+        escape.logField(client_addr),
+        escape.logField(from_domain),
+        elapsed_ms,
+    });
+    return result;
+}
+
+/// Perform DMARC evaluation at end-of-message.
+///
+/// 1. Extract From: header domain
+/// 2. Read upstream A-R headers to find SPF and DKIM results
+/// 3. DNS lookup _dmarc.<from_domain> TXT
+/// 4. Parse DMARC record, check alignment, determine result
+/// 5. Add our own A-R header with DMARC result
+fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
+    // Step 0: A message with more than one From field has no single author
+    // domain to evaluate. RFC 5322 forbids it and RFC 7489 §6.6.1 declines to
+    // guess; picking one instance means the domain we authenticate can differ
+    // from the one the reader is shown. Fail rather than choose.
+    const from_count = countFromHeaders(conn);
+    if (from_count > 1) {
+        addArHeaderSimple(conn, ctx, "fail", "multiple From header fields") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
+        return @intFromEnum(responses.Code.@"continue");
+    }
+
+    // Step 1: Extract From: domain
+    const from_domain = getFromDomain(conn) orelse {
+        addArHeaderSimple(conn, ctx, "none", "no From header") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
+        return @intFromEnum(responses.Code.@"continue");
+    };
+
+    // Step 2: Parse upstream Authentication-Results headers
+    // The envelope-from domain is what SPF authenticated
+    const envelope_domain = getEnvelopeDomain(conn);
+
+    // Each DKIM signature contributes its own (result, d=) pair, and they stay
+    // paired — see `upstream.zig`, which is where audit M-6 lives.
+    var up = upstream.collect(conn.allocator, conn.headers.items, ctx.authserv_id, MAX_DKIM_IDENTIFIERS);
+    defer up.deinit(conn.allocator);
+
+    const spf_result = up.spf_result;
+    const dkim_idents = up.dkim;
+
+    if (up.truncated) {
+        log.warn(
+            "more than {d} DKIM results in Authentication-Results; evaluating the first {d}",
+            .{ MAX_DKIM_IDENTIFIERS, MAX_DKIM_IDENTIFIERS },
+        );
+    }
+
+    // Step 3: Policy discovery and Organizational Domain, both by DNS tree
+    // walk (RFC 9989 §4.10). The walk starts at the Author Domain: if it
+    // publishes a record that is the policy, and the walk continues upward
+    // only to establish where the organizational boundary lies.
+    const resolver = ctx.resolver();
+
+    var author_walk = treewalk.walk(conn.allocator, resolver, from_domain) catch {
+        addArHeaderSimple(conn, ctx, "temperror", "internal error") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
+        return @intFromEnum(responses.Code.@"continue");
+    };
+    defer author_walk.deinit();
+
+    // §4.10.1: the Author Domain's own record wins; otherwise the record
+    // belonging to its Organizational or Public Suffix Domain applies.
+    const selected = author_walk.recordAtStart() orelse author_walk.policyRecord() orelse {
+        if (author_walk.transient_error) {
+            addArHeaderSimple(conn, ctx, "temperror", "DNS lookup failed") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
+        } else {
+            addArHeaderSimple(conn, ctx, "none", "no DMARC record found") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
+        }
+        return @intFromEnum(responses.Code.@"continue");
+    };
+
+    // §4.10.1: a record whose p= is missing or invalid, or which carries an
+    // invalid sp= or np=, is not simply ignored. A valid rua= makes it act as
+    // p=none; without one, DMARC does not apply to this message at all.
+    //
+    // The second branch is why this is a decision and not a default: reporting
+    // `none` here is the RFC's answer, whereas falling through to a parent's
+    // record -- what returning null from parseRecord used to cause -- could
+    // apply an organizational `p=reject` to a domain the RFC says to leave
+    // alone, and reject mail on the strength of a malformed record.
+    var rec = selected;
+    switch (rec.applicability()) {
+        .apply => {},
+        .as_none => {
+            rec.policy = .none;
+            rec.subdomain_policy = null;
+            log.info("dmarc: {s}: record has no usable policy but a valid rua=, applying p=none per RFC 9989 4.10.1", .{from_domain});
+        },
+        .no_processing => {
+            log.info("dmarc: {s}: record has no usable policy and no valid rua=, no DMARC processing per RFC 9989 4.10.1", .{from_domain});
+            addArHeaderSimple(conn, ctx, "none", "record has no usable policy") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
+            return @intFromEnum(responses.Code.@"continue");
+        },
+    }
+
+    const from_org = treewalk.organizationalDomain(&author_walk, ctx.psl);
+    const is_subdomain = !std.ascii.eqlIgnoreCase(from_domain, from_org);
+
+    // Step 4: Resolve each authenticated identifier's own Organizational
+    // Domain. Only needed for relaxed mode and only for identifiers that
+    // actually passed — strict mode is a string comparison (§4.10.2).
+    var spf_ident = alignment.Identifier{ .domain = envelope_domain, .result = spf_result };
+
+    var spf_walk = treewalk.orgWalk(conn.allocator, resolver, rec.aspf, from_domain, from_org, &spf_ident, ctx.psl);
+    defer if (spf_walk) |*w| w.deinit();
+
+    // One walk per DKIM identifier, each kept alive because the identifier's
+    // `org_domain` points into it. `orgWalk` returns null for the cases that
+    // need no DNS at all (strict mode, a result that did not pass, a domain
+    // equal to the Author Domain), so the common single-signature message still
+    // costs exactly one walk. MAX_DKIM_IDENTIFIERS is what stops a message
+    // carrying a hundred signatures from buying a hundred tree walks (X-4).
+    var dkim_walks: [MAX_DKIM_IDENTIFIERS]?treewalk.Walk = @splat(null);
+    defer for (&dkim_walks) |*w| {
+        if (w.*) |*walk| walk.deinit();
+    };
+    for (dkim_idents, 0..) |*ident, i| {
+        dkim_walks[i] = treewalk.orgWalk(conn.allocator, resolver, rec.adkim, from_domain, from_org, ident, ctx.psl);
+    }
+
+    // Step 5: Evaluate alignment
+    //
+    // The detailed form keeps the two alignment booleans the verdict was built
+    // from, which the reporting event has to state and cannot safely re-derive
+    // (audit M-7a).
+    const evaluation = dmarc.evaluateDetailed(&rec, from_domain, from_org, spf_ident, dkim_idents);
+    const result = evaluation.result;
+
+    // Report the signature the verdict actually rests on: the aligned one when
+    // there is one, otherwise the first, so a `dkim=pass` in the event is never
+    // paired with a `d=` from some other signature — the M-6 defect itself.
+    const reported_dkim = dmarc.alignedDkim(&rec, from_domain, from_org, dkim_idents) orelse
+        if (dkim_idents.len > 0) dkim_idents[0] else alignment.Identifier{};
+
+    // Step 6: Add Authentication-Results header
+    // Sampling keys off the Message-ID so a retried message keeps the verdict it
+    // was given; see `dmarc.inSample`. Absent, the message counts as selected.
+    const disposition = dmarc.effectivePolicySampled(
+        &rec,
+        is_subdomain,
+        ctx.sampling,
+        getMessageId(conn),
+    ).toString();
+    addArHeaderFull(conn, ctx, result.toString(), from_domain, disposition) catch |err|
+        return auth_stamp.deferCode(err, "dmarc");
+
+    // Publish ZMQ event with full evaluation details
+    publishEvent(ctx, conn.allocator, .{
+        // Via the accessor so this is populated on a stock MTA, where the
+        // {client_addr} macro is not sent. An empty value here is not cosmetic:
+        // client_ip is mandatory on every RFC 7489 SS7.2 <record><row>, so an
+        // event without it cannot become a valid aggregate report row.
+        .client_ip = conn.clientAddr() orelse "",
+        .header_from = from_domain,
+        .from_address = getFromAddress(conn) orelse "",
+        .envelope_from = envelope_domain orelse "",
+        .policy = dmarc.publishedPolicy(&rec, is_subdomain).toString(),
+        .disposition = disposition,
+        .dmarc_result = result.toString(),
+        .spf_result = spf_result orelse "none",
+        .spf_aligned = evaluation.spf_aligned,
+        .dkim_result = reported_dkim.result orelse "none",
+        .dkim_domain = reported_dkim.domain orelse "",
+        .dkim_aligned = evaluation.dkim_aligned,
+    });
+
+    return @intFromEnum(responses.Code.@"continue");
+}
+
+// =============================================================================
+// Helper functions
+// =============================================================================
+
+fn countFromHeaders(conn: *connection_mod.Connection) usize {
+    var count: usize = 0;
+    for (conn.headers.items) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "From")) count += 1;
+    }
+    return count;
+}
+
+/// The Message-ID this message carries, if it carries exactly one.
+///
+/// Null when absent *or* duplicated. A second Message-ID would let a sender pick
+/// which one we sample on, and RFC 5322 §3.6 allows at most one, so a message
+/// with two has no single identity to key a stable decision to (audit M-4).
+fn getMessageId(conn: *connection_mod.Connection) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (conn.headers.items) |hdr| {
+        if (!std.ascii.eqlIgnoreCase(hdr.name, "Message-ID")) continue;
+        if (found != null) return null;
+        found = mem.trim(u8, hdr.value, &std.ascii.whitespace);
+    }
+    return found;
+}
+
+/// The address in the `From` header, without any display name.
+///
+/// Split out from `getFromDomain` so the reporting event can state the full
+/// address RFC 7489 §7.2 asks for without a second, possibly divergent, parse of
+/// the same header (audit M-7a).
+fn getFromAddress(conn: *connection_mod.Connection) ?[]const u8 {
+    for (conn.headers.items) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "From")) {
+            // Extract email address from From: header value
+            // Handle "Display Name <addr@domain>" and bare "addr@domain"
+            const val = mem.trim(u8, hdr.value, &std.ascii.whitespace);
+            if (mem.lastIndexOfScalar(u8, val, '>')) |gt| {
+                if (mem.lastIndexOfScalar(u8, val[0..gt], '<')) |lt| {
+                    return val[lt + 1 .. gt];
+                }
+            }
+            return val;
+        }
+    }
+    return null;
+}
+
+fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
+    return alignment.getDomainFromEmail(getFromAddress(conn) orelse return null);
+}
+
+fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
+    const raw = conn.mail_from_raw orelse return null;
+    const addr = alignment.stripAngleBrackets(raw);
+    return alignment.getDomainFromEmail(addr);
+}
+
+/// One DMARC evaluation, as the future `securedmarc-reporter` needs to see it.
+///
+/// The field set is the one the suite plan specifies, which in turn is what
+/// RFC 7489 §7.2 requires of an aggregate report row. Five of these used to be
+/// absent (audit M-7a). `client_ip` was the one that mattered: it is mandatory on
+/// every `<record><row>` and it is the only field here that a subscriber cannot
+/// reconstruct after the fact, because the connecting address is known to the
+/// milter and to nothing downstream of it.
+const Event = struct {
+    client_ip: []const u8,
+
+    /// The RFC5322.From **domain**, which is what an aggregate report's
+    /// `<header_from>` holds: RFC 9990 SS3.1.1.10 and RFC 7489 Appendix C both
+    /// define the element as "the RFC5322.From domain from the message".
+    ///
+    /// It held the full mailbox until 2026-08-02, which made the one field a
+    /// reporter can copy straight into the XML the one field it must not. The
+    /// name is the report's, so it carries the report's meaning; the mailbox is
+    /// next door under a name the RFC does not use for anything.
+    header_from: []const u8,
+
+    /// The whole RFC5322.From mailbox, local-part included.
+    ///
+    /// Ours, not an aggregate-report field -- DMARC authenticates a domain and
+    /// RFC 7489 SS1 is explicit that it "does not authenticate the local-part".
+    /// Kept because it is useful for forensics and for operators reading the
+    /// event stream directly, and deliberately not named `header_from`.
+    from_address: []const u8,
+
+    /// The RFC5321.MailFrom **domain** (RFC 9990 SS3.1.1.10), matching
+    /// `header_from` in granularity rather than the mailbox above.
+    envelope_from: []const u8,
+    /// What the Domain Owner published, before `t=y` or `pct=` reduced it.
+    policy: []const u8,
+    /// What we actually applied, after those reductions.
+    disposition: []const u8,
+    dmarc_result: []const u8,
+    spf_result: []const u8,
+    spf_aligned: bool,
+    dkim_result: []const u8,
+    dkim_domain: []const u8,
+    dkim_aligned: bool,
+};
+
+fn publishEvent(ctx: MsgCtx, allocator: Allocator, ev: Event) void {
+    const json = formatEvent(allocator, ev) catch return;
+    defer allocator.free(json);
+
+    ctx.publisher().publish(json);
+}
+
+/// Serialize one event.
+///
+/// Separate from `publishEvent` so the payload can be asserted on without a ZMQ
+/// socket: the field set is a contract with a consumer that does not exist yet,
+/// which is exactly the kind of thing that silently rots if nothing checks it.
+fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
+    // `header_from`, `from_address`, `dkim_domain` and `envelope_from` all
+    // originate in the message or its envelope, so each is sender-chosen; the
+    // results, the policy and the disposition are ours, and `client_ip` comes
+    // from the MTA rather than the message. A `"` in any sender-chosen value used
+    // to end its JSON string early and leave the rest of the payload to be
+    // reinterpreted by the consumer (audit X-5), so every value that did not
+    // originate here is escaped — `client_ip` included, since a value being
+    // trustworthy today is not a reason for the payload to depend on it.
+    return std.fmt.allocPrint(allocator,
+        \\{{"client_ip":"{f}","header_from":"{f}","from_address":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
+    , .{
+        escape.jsonString(ev.client_ip),
+        escape.jsonString(ev.header_from),
+        escape.jsonString(ev.from_address),
+        escape.jsonString(ev.envelope_from),
+        ev.policy,
+        ev.disposition,
+        ev.dmarc_result,
+        ev.spf_result,
+        if (ev.spf_aligned) "true" else "false",
+        ev.dkim_result,
+        escape.jsonString(ev.dkim_domain),
+        if (ev.dkim_aligned) "true" else "false",
+    });
+}
+
+/// Record the DMARC result on the message.
+///
+/// Both stamping functions here returned `void` and swallowed every failure, so
+/// a message could be delivered carrying no `dmarc=` field while the daemon
+/// reported success (audit X-9). This daemon is the end of the chain: its field
+/// is what a downstream mailbox provider or a local delivery rule reads to decide
+/// disposition. Losing it silently means the message is treated as if DMARC was
+/// never evaluated, which for a `p=reject` domain is the difference between a
+/// rejection and a delivery.
+fn addArHeaderSimple(conn: *connection_mod.Connection, ctx: MsgCtx, result_str: []const u8, reason: []const u8) !void {
+    try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
+        .{
+            .method = "dmarc",
+            .result = result_str,
+            .reason = reason,
+            .properties = &.{},
+        },
+    }, conn.negotiated_protocol.header_leading_space);
+}
+
+fn addArHeaderFull(
+    conn: *connection_mod.Connection,
+    ctx: MsgCtx,
+    result_str: []const u8,
+    from_domain: []const u8,
+    disposition: []const u8,
+) !void {
+    const reason = try std.fmt.allocPrint(conn.allocator, "p={s}", .{disposition});
+    defer conn.allocator.free(reason);
+
+    try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
+        .{
+            .method = "dmarc",
+            .result = result_str,
+            .reason = reason,
+            .properties = &.{.{
+                .ptype = "header",
+                .property = "from",
+                .value = from_domain,
+            }},
+        },
+    }, conn.negotiated_protocol.header_leading_space);
+}
+
+test "M-7a: the event carries every field an aggregate report row needs" {
+    // The consumer does not exist yet, so nothing else would notice a field going
+    // missing until the reporter was written and found the data unrecoverable.
+    // `client_ip` is the one that cannot be backfilled: it is mandatory on every
+    // RFC 7489 §7.2 `<record><row>` and only the milter ever sees it.
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "bounce.example.com",
+        .policy = "reject",
+        .disposition = "quarantine",
+        .dmarc_result = "fail",
+        .spf_result = "pass",
+        .spf_aligned = false,
+        .dkim_result = "pass",
+        .dkim_domain = "example.com",
+        .dkim_aligned = true,
+    });
+    defer std.testing.allocator.free(json);
+
+    for ([_][]const u8{
+        "\"client_ip\":\"203.0.113.42\"",
+        // A *domain*, and the fixture says so. RFC 9990 SS3.1.1.10 defines the
+        // report element of this name as "the RFC5322.From domain from the
+        // message", so a reporter copies this field straight into
+        // `<identifiers><header_from>`. It carried `sender@example.com` until
+        // 2026-08-02, which would have put a local-part into every report row
+        // -- data DMARC does not authenticate and the schema does not describe.
+        "\"header_from\":\"example.com\"",
+        "\"from_address\":\"sender@example.com\"",
+        "\"envelope_from\":\"bounce.example.com\"",
+        "\"policy\":\"reject\"",
+        "\"disposition\":\"quarantine\"",
+        "\"dmarc_result\":\"fail\"",
+        "\"spf_aligned\":false",
+        "\"dkim_aligned\":true",
+    }) |needle| {
+        if (mem.indexOf(u8, json, needle) == null) {
+            std.debug.print("event payload missing {s}\ngot: {s}\n", .{ needle, json });
+            return error.TestFailed;
+        }
+    }
+}
+
+test "M-7a: the published policy and the applied disposition are reported separately" {
+    // A domain mid-rollout publishes `p=reject` and gets `quarantine` applied.
+    // Reporting only one of the two would make it indistinguishable, in the
+    // aggregate report, from a domain that asked for `quarantine` outright -- so
+    // the Domain Owner could not tell their own rollout was in effect.
+    var record = dmarc.DmarcRecord{ .policy = .reject, .testing = .testing };
+
+    const published = dmarc.publishedPolicy(&record, false);
+    const applied = dmarc.effectivePolicySampled(&record, false, .ignore, null);
+
+    try std.testing.expectEqualStrings("reject", published.toString());
+    try std.testing.expectEqualStrings("quarantine", applied.toString());
+
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "example.com",
+        .policy = published.toString(),
+        .disposition = applied.toString(),
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"reject\"") != null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"disposition\":\"quarantine\"") != null);
+}
+
+test "M-7a: a quote in a sender-chosen field cannot break the payload" {
+    // from_address is taken from the message, so it is chosen by whoever sent it.
+    // Unescaped, the `"` would close the string and hand the rest of the object to
+    // the sender to redefine -- X-5, in a new field.
+    const json = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .header_from = "example.com",
+        .from_address = "a\",\"policy\":\"none\",\"x\":\"b@example.com",
+        .envelope_from = "example.com",
+        .policy = "reject",
+        .disposition = "reject",
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+    });
+    defer std.testing.allocator.free(json);
+
+    // The injected `"policy":"none"` must not appear as a structural member.
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"none\"") == null);
+    try std.testing.expect(mem.indexOf(u8, json, "\"policy\":\"reject\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "reject",
+        parsed.value.object.get("policy").?.string,
+    );
+}
+// X-9: both wrappers must stay fallible.
+//
+// Both returned `void` and swallowed every failure, so a message could be
+// delivered with no `dmarc=` field while this daemon reported success. This
+// daemon is the end of the chain, so that field is the only record of the
+// verdict: losing it silently means the message is treated as though DMARC was
+// never evaluated, which for a `p=reject` domain is the difference between a
+// rejection and a delivery.
+test "the DMARC stamping wrappers cannot swallow failures" {
+    comptime {
+        for (.{ addArHeaderSimple, addArHeaderFull }) |f| {
+            const ret = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+            if (@typeInfo(ret) != .error_union) @compileError(
+                "the DMARC stamping wrappers must return an error union. Swallowing a " ++
+                    "failure delivers the message with no dmarc= field while reporting " ++
+                    "success, and this daemon is the end of the chain: nothing downstream " ++
+                    "can reconstruct the verdict (audit X-9).",
+            );
+            if (@typeInfo(ret).error_union.payload != void) @compileError(
+                "the DMARC stamping wrappers should return !void.",
+            );
+        }
+    }
+}
+
+test "get from domain" {
+    // This test validates the From: header parsing logic conceptually.
+    // Full integration with Connection struct requires the milter framework.
+    const from_value = "User Name <user@example.com>";
+    // Simulate the parsing logic
+    if (mem.lastIndexOfScalar(u8, from_value, '>')) |gt| {
+        if (mem.lastIndexOfScalar(u8, from_value[0..gt], '<')) |lt| {
+            const addr = from_value[lt + 1 .. gt];
+            const domain = alignment.getDomainFromEmail(addr);
+            try std.testing.expectEqualStrings("example.com", domain.?);
+            return;
+        }
+    }
+    return error.TestFailed;
+}
