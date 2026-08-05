@@ -252,7 +252,7 @@ test "the implicit listener binds loopback, not every interface" {
     }
 }
 test "M-4: ApplyPct is off unless the config says otherwise" {
-    // The function-level guard in dmarc_test.zig proves `ignore` is inert; this
+    // The function-level guard in dmarc.zig proves `ignore` is inert; this
     // proves `ignore` is what an operator who says nothing actually gets. They
     // are different failures: shipping the wrong default would silently stop
     // enforcing every domain still publishing pct=0, and no test of

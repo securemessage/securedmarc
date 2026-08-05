@@ -295,7 +295,6 @@ fn onWorkerReload() void {
 // `zig build test` pass.
 test {
     _ = dmarc;
-    _ = @import("dmarc_test.zig");
     _ = alignment;
     _ = treewalk;
     _ = psl;
