@@ -193,6 +193,7 @@ fn runDaemon() !void {
         .foreground = dmarc_cfg.foreground,
         .pid_file = dmarc_cfg.pid_file,
         .user = dmarc_cfg.user,
+        .umask = dmarc_cfg.umask,
         .worker_threads = dmarc_cfg.worker_threads,
         .max_connections = dmarc_cfg.max_connections,
         .num_listeners = @intCast(dmarc_cfg.listen_addresses.len),
