@@ -1,3 +1,31 @@
+# 2026-08-05, EVERY NUMBER BELOW PREDATES A CHANGE TO WHAT IS COUNTED. Read the
+#   figures in the older notes as historical; they do not describe these files now.
+#
+#   Until today `prod_lines` charged a comment sitting above ordinary code and
+#   freed one only above a `test` -- while the checker's own header stated the rule
+#   as "comments and tests never count". The code now does what the header always
+#   said it did. Across the six packages that moved the counted total from 21,353
+#   to 12,408 -- 41% of what was being measured was comment text -- and the count
+#   of files over the goal from 15 to 2, with no code removed anywhere.
+#
+#   So a ceiling quoted below is a comment-INCLUSIVE number and cannot be compared
+#   against one measured today. The reasoning in those notes stands unchanged; only
+#   their figures are on the old scale. This package now has NO entries at all:
+#   dmarc.zig read 511 on the old scale and 254 on this one, flow.zig 455 and 247.
+#
+#   Two things in the notes below are worth rereading against this. The first is
+#   the argument that dmarc.zig should not be split because `parseRecord` and the
+#   small policy helpers are all RFC 9989 clauses that belong beside the record
+#   they read -- unchanged, and now backed by a 254-line measurement. The second is
+#   the honest admission that splitting securedmarc three ways COST +95 lines
+#   overall; on this scale that split bought even less than it appeared to, which
+#   is an argument against doing the same to anything else.
+#
+#   THE CONSOLIDATION WORK IS NO LONGER JUSTIFIED BY LENGTH. Thirteen files stopped
+#   being flagged without losing a line of code. What still justifies it is
+#   duplication -- four copies of one tag scanner, two of one tool -- which this
+#   gate has never been able to see.
+#
 # 2026-07-29, CORRECTED THEN FIXED: an earlier version of this warning said only
 #   `zig build lint -- --update` erased the comments here. That was too narrow. The
 #   ORDINARY gate run rewrote the file too, on its self-tightening path, so every
@@ -156,5 +184,3 @@
 # Adding an entry by hand is how you knowingly accept a long file:
 #   zig build lint -- --update
 # An empty list below means every file meets the goal.
-511 src/dmarc.zig
-455 src/flow.zig
