@@ -67,8 +67,10 @@ stated security reason:
 
 So the queries are expected output, not incidental traffic: an implementation
 that reaches the right Organizational Domain after four hundred lookups is
-wrong, and no outcome assertion can see that. `dmarcdns.DmarcDns` records every
-query in arrival order and the suite compares the sequence.
+wrong, and no outcome assertion can see that. The shared DNS fake in
+`securemilter-lib/test/dnsfake.py` records every TXT query in arrival order and the
+suite compares the sequence. TXT only, deliberately: a query of another type must
+not silently join a sequence the RFC defines in terms of DMARC record lookups.
 
 These cases pass only `--from`, so exactly one walk runs. The resolver under test
 caches, so a name already looked up by an earlier walk in the same process does

@@ -2,7 +2,7 @@
 """Drive the RFC 9989 Appendix B examples against `securedmarc-check`.
 
 Each case brings its own DNS zone, which is served on a loopback port by
-`dmarcdns.DmarcDns` so the daemon's own resolver does the lookups. Nothing is
+the shared DNS fake so the daemon's own resolver does the lookups. Nothing is
 stubbed inside `securedmarc`: the checker calls the same `treewalk.walk`,
 `treewalk.organizationalDomain`, `treewalk.orgWalk`, `dmarc.evaluate` and
 `dmarc.getDisposition` that the milter's `onEom` calls.
@@ -21,7 +21,14 @@ import os
 import subprocess
 import sys
 
-from dmarcdns import DmarcDns
+# One DNS fake serves every conformance suite in the tree; securemilter-lib's
+# test/dnsfake.py records why it is not four any more. Reachable because
+# build.zig.zon already depends on ../securemilter-lib by path, so the six
+# repositories are checked out side by side.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "..", "securemilter-lib", "test"))
+
+from dnsfake import DnsFake, TxtZone   # noqa: E402
 from cases import ALL_CASES
 
 DEFAULT_CHECK = os.path.join(
@@ -46,7 +53,7 @@ def parse_output(text):
 def run_case(case, check_bin, port, verbose):
     """Run one case. Returns (ok, list_of_problem_strings)."""
     problems = []
-    with DmarcDns(case.get("zone"), port, verbose=verbose) as dns:
+    with DnsFake(TxtZone(case.get("zone")), port=port, verbose=verbose) as dns:
         cmd = [check_bin, "-n", "127.0.0.1", "-p", str(port)] + case["args"]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=30)
