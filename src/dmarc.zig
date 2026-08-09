@@ -165,11 +165,9 @@ pub const Applicability = enum {
 /// §4.8 says to ignore. A URI needs a scheme -- ALPHA followed by ALPHA /
 /// DIGIT / "+" / "-" / "." -- then ":" and a non-empty remainder.
 ///
-/// Scheme *support* is deliberately not considered. §4.6 says a receiver must
-/// ignore URIs whose schemes it does not support, but that governs whether a
-/// report is sent; §4.10.1 asks only whether a URI is syntactically valid. A
-/// record listing `https://` alone still counts here even though this daemon
-/// sends no reports at all, because the question is what policy to apply.
+/// Scheme support is not checked: §4.6 ignores unsupported schemes (governs sending);
+/// §4.10.1 asks only syntactic validity (governs policy application). A `https://`
+/// URI counts here even if the daemon sends no reports.
 pub fn hasValidReportingUri(rua: []const u8) bool {
     var iter = mem.splitScalar(u8, rua, ',');
     while (iter.next()) |raw| {
@@ -331,10 +329,8 @@ pub const Evaluation = struct {
 
 /// `evaluate`, keeping the alignment facts instead of reducing them to pass/fail.
 ///
-/// Returned rather than left to the caller to re-derive, for the same reason
-/// `alignedDkim` returns the identifier: a second independent scan can reach a
-/// different conclusion than the one the verdict was built on, which is the M-6
-/// defect exactly. One computation, one set of facts.
+/// Returned rather than re-derived by caller: independent scans can reach different
+/// conclusions (audit M-6). One computation, one set of facts.
 pub fn evaluateDetailed(
     record: *const DmarcRecord,
     from_domain: []const u8,

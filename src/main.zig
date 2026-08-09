@@ -44,12 +44,8 @@ var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 /// 0 disables.
 var g_max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS;
 
-/// `daemon.Options.spawn_threads`: start the DNS health monitor.
-///
-/// Context-free because that is what `daemon.Options` takes, and deliberately so — the
-/// hook runs at the one point in the bootstrap where creating a thread is safe, after
-/// the fork and after the managed signals are blocked. `g_allocator` and `g_dns_config`
-/// are both set from the parsed configuration before then.
+/// Start health monitor. Context-free to match `daemon.Options.spawn_threads`;
+/// safe after daemonize and signal blocking.
 fn spawnHealthMonitor() void {
     g_health_monitor = dns_mod.startMonitor(g_allocator, g_dns_config.nameservers);
 }
