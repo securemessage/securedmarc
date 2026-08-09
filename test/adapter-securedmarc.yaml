@@ -1,0 +1,7 @@
+# Adapter: SecureMilter securedmarc
+# {bin} is zig-out/bin/securedmarc-check; per-case flags splice at {case_args}.
+name: securedmarc
+suite: rfc9989-dmarc
+argv: ["{bin}", "-n", "{dns_addr}", "-p", "{dns_port}", "{case_args}"]
+verdict:
+  kind: kv

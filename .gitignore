@@ -11,9 +11,7 @@ zig-cache/
 # pattern.
 *.core
 
-# Python bytecode from the RFC 9989 conformance harness in test/rfc9989/. Listed
-# by pattern for the same reason as *.core above: a .pyc was committed into
-# securespf on 2026-07-29 because only the one filename that had already caused
-# trouble was ignored.
+# Python bytecode. The RFC 9989 harness moved to the rfc-suites repository
+# (PHP) on 2026-08-09; no Python remains in this repo, but the pattern stays.
 __pycache__/
 *.pyc

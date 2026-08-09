@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout securedmarc
+        uses: actions/checkout@v4
+        with:
+          path: securedmarc
+
+      - name: Checkout securemilter-lib (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/securemilter-lib
+          path: securemilter-lib
+
+      - name: Checkout rfc-suites (conformance framework, pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: securemessage/rfc-suites
+          path: rfc-suites
+          ref: v0.1.0
+          token: ${{ secrets.FORGE_TOKEN }}
+
+      - name: PHP ext-yaml
+        run: php -m | grep -qi '^yaml$' || doas pkg install -y php84-pecl-yaml
+
+      - name: Build
+        run: cd securedmarc && zig build
+
+      - name: Unit tests
+        run: cd securedmarc && zig build test
+
+      - name: RFC 9989 conformance (DMARC)
+        run: |
+          cd securedmarc && php ../rfc-suites/suites/rfc9989-dmarc/run.php \
+            --adapter test/adapter-securedmarc.yaml \
+            --bin zig-out/bin/securedmarc-check
