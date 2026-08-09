@@ -39,6 +39,9 @@ jobs:
       - name: Build
         run: cd securedmarc && zig build
 
+      - name: Lint
+        run: cd securedmarc && zig build lint
+
       - name: Unit tests
         run: cd securedmarc && zig build test
 
