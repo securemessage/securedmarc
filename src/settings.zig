@@ -12,6 +12,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const config_mod = securemilter.config;
 const listener_mod = securemilter.listener;
+const deadline_mod = securemilter.deadline;
 const connection_mod = securemilter.connection;
 const worker_mod = securemilter.worker;
 
@@ -47,6 +48,10 @@ pub const DmarcConfig = struct {
     apply_pct: bool,
     public_suffix_list: ?[]const u8,
     limits: connection_mod.Limits,
+    /// Wall-clock bound on one message's evaluation, in ms; 0 disables (X-21).
+    /// The DMARC policy walk and each DKIM identifier's org-domain walk are
+    /// the DNS steps it bounds.
+    max_evaluation_ms: i64,
 };
 /// Parse the SecureDMARC config from a loaded Config.
 pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !DmarcConfig {
@@ -112,6 +117,9 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     // for domains that have not moved yet (audit M-4).
     const apply_pct = global.getBool("ApplyPct", false);
 
+    // X-21: shared spelling and default with securespf's limit of the same name.
+    const max_evaluation_ms = global.getInt(deadline_mod.OPTION_NAME, i64, deadline_mod.DEFAULT_MS);
+
     // Optional Public Suffix List, used only to veto a tree-walk result.
     const public_suffix_list = global.get("PublicSuffixList");
 
@@ -140,6 +148,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         .apply_pct = apply_pct,
         .public_suffix_list = public_suffix_list,
         .limits = limits,
+        .max_evaluation_ms = max_evaluation_ms,
     };
 }
 

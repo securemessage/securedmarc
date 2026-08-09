@@ -15,6 +15,7 @@ const escape = securemilter.escape;
 const responses = securemilter.milter.responses;
 const header_scrub = securemilter.header_scrub;
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
 
@@ -51,6 +52,11 @@ pub const MsgCtx = struct {
     /// choice, for the same reason, as `securespf` and `securedkim`.
     resolver: *const fn () *dns_mod.Resolver,
     publisher: *const fn () *zmq.Publisher,
+    /// Wall-clock bound on one message's evaluation, in ms; 0 disables (X-21).
+    /// No default: it must come from configuration -- a silently supplied
+    /// constant is the L-2 mechanism. The DMARC walk and each DKIM
+    /// identifier's org-domain walk are the DNS steps it bounds.
+    max_evaluation_ms: i64,
 };
 
 /// How many DKIM results from `Authentication-Results` are evaluated.
@@ -147,7 +153,19 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // walk (RFC 9989 §4.10). The walk starts at the Author Domain: if it
     // publishes a record that is the policy, and the walk continues upward
     // only to establish where the organizational boundary lies.
+    //
+    // X-21: the deadline starts here, before the first DNS-dependent step, and
+    // is checked again before each DKIM identifier's org walk below. Expiry is
+    // temperror -- the message was not judged, and must not read as fail.
+    const deadline = deadline_mod.Deadline.fromNow(ctx.max_evaluation_ms);
     const resolver = ctx.resolver();
+
+    if (deadline.expired()) {
+        log.warn("dmarc: evaluation deadline exceeded before policy discovery", .{});
+        addArHeaderSimple(conn, ctx, "temperror", "evaluation deadline exceeded") catch |err|
+            return auth_stamp.deferCode(err, "dmarc");
+        return @intFromEnum(responses.Code.@"continue");
+    }
 
     var author_walk = treewalk.walk(conn.allocator, resolver, from_domain) catch {
         addArHeaderSimple(conn, ctx, "temperror", "internal error") catch |err|
@@ -216,6 +234,16 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         if (w.*) |*walk| walk.deinit();
     };
     for (dkim_idents, 0..) |*ident, i| {
+        // X-21: each walk costs DNS; the deadline decides whether another is
+        // spent. Expiry is a temperror for the whole message -- evaluating
+        // alignment from a PARTIAL set of walks would judge the message on
+        // evidence we did not gather.
+        if (deadline.expired()) {
+            log.warn("dmarc: evaluation deadline exceeded during org-domain walks", .{});
+            addArHeaderSimple(conn, ctx, "temperror", "evaluation deadline exceeded") catch |err|
+                return auth_stamp.deferCode(err, "dmarc");
+            return @intFromEnum(responses.Code.@"continue");
+        }
         dkim_walks[i] = treewalk.orgWalk(conn.allocator, resolver, rec.adkim, from_domain, from_org, ident, ctx.psl);
     }
 

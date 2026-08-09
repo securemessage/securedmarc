@@ -105,6 +105,17 @@ ZmqTopic        = dmarc
 # it will believe, which is finding M-1/X-1 without forging a header, and under
 # p=reject it decides what gets bounced. Widen only if Postfix genuinely runs on
 # another machine, and then restrict it with pf.
+
+# --- Evaluation time budget (X-21) ---
+#
+# MaxEvaluationMs is the wall-clock ceiling in milliseconds for evaluating one
+# message, shared by every DNS lookup the verdict needs. Exhausting it gives
+# temperror, never fail: the message was not judged, and the sender retries.
+# A slow resolver, not a hostile sender, is what it guards against.
+#
+# 0 disables it. Takes effect at startup; SIGHUP does not pick up a change.
+# MaxEvaluationMs = 20000
+
 [listener:inbound]
 # The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
 # configuration ERROR, not a synonym for 127.0.0.1. A Socket value that cannot be

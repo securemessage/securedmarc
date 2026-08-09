@@ -11,6 +11,7 @@ const daemon_mod = securemilter.daemon;
 const bootstrap_mod = securemilter.bootstrap;
 const negotiate = securemilter.milter.negotiate;
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 const zmq = securemilter.zmq;
 const log = securemilter.log;
 const header_scrub = securemilter.header_scrub;
@@ -38,6 +39,10 @@ var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dmarc"} };
 /// `t=`, which is a transition still in progress.
 var g_sampling: dmarc.SamplingPolicy = .ignore;
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
+
+/// Wall-clock bound on one message's evaluation (X-21). Set once at startup;
+/// 0 disables.
+var g_max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS;
 
 /// `daemon.Options.spawn_threads`: start the DNS health monitor.
 ///
@@ -103,6 +108,7 @@ fn msgCtx() flow.MsgCtx {
         .psl = pslPtr(),
         .resolver = getResolver,
         .publisher = getPublisher,
+        .max_evaluation_ms = g_max_evaluation_ms,
     };
 }
 
@@ -155,6 +161,7 @@ fn runDaemon() !void {
     // Set module-level globals
     g_authserv_id = dmarc_cfg.authserv_id;
     g_sampling = if (dmarc_cfg.apply_pct) .honor else .ignore;
+    g_max_evaluation_ms = dmarc_cfg.max_evaluation_ms;
     g_dns_config = .{
         .nameservers = dmarc_cfg.dns_nameservers,
         .timeout_ms = dmarc_cfg.dns_timeout_ms,

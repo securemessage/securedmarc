@@ -231,6 +231,15 @@ being deferred.
 Both are read at startup only;
 .Dv SIGHUP
 does not change them.
+.It Cm MaxEvaluationMs
+The wall-clock ceiling in milliseconds for evaluating one message, shared by
+every DNS lookup the verdict needs.
+Default: 20000.
+0 disables it.
+.Pp
+Exhausting the budget yields temperror, never fail: the message was not
+judged, and the sender retries.
+A slow resolver, not a hostile sender, is what it guards against.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

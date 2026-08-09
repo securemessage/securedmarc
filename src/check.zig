@@ -32,6 +32,7 @@ const Allocator = mem.Allocator;
 const securemilter = @import("securemilter");
 const cli = securemilter.cli.Tool("securedmarc-check");
 const dns_mod = securemilter.dns;
+const deadline_mod = securemilter.deadline;
 
 const dmarc = @import("dmarc.zig");
 const treewalk = @import("treewalk.zig");
@@ -53,6 +54,8 @@ const Usage =
     \\  --psl <file>            Public Suffix List used only to veto a tree-walk result
     \\  -n <nameserver>         DNS nameserver (default: 127.0.0.1)
     \\  -p <port>               DNS nameserver port (default: 53)
+    \\  -m <ms>                 Wall-clock budget for the evaluation (default:
+    \\                          20000, the daemon's MaxEvaluationMs; 0 disables)
     \\  -h                      Show this help
     \\
     \\Output keys:
@@ -79,6 +82,9 @@ const Args = struct {
     psl_path: ?[]const u8 = null,
     nameserver: []const u8 = "127.0.0.1",
     port: u16 = 53,
+    /// The daemon's MaxEvaluationMs (X-21), on the CLI so the tool answers the
+    /// question the daemon answers.
+    max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
 };
 
 fn parseArgs(allocator: Allocator) !Args {
@@ -108,6 +114,12 @@ fn parseArgs(allocator: Allocator) !Args {
         } else if (mem.eql(u8, arg, "-p")) {
             const raw = it.next() orelse cli.fatal("-p needs a value");
             result.port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("invalid port");
+        } else if (mem.eql(u8, arg, "-m")) {
+            const raw = it.next() orelse cli.fatal("-m needs a value");
+            result.max_evaluation_ms = std.fmt.parseInt(i64, raw, 10) catch
+                cli.fatal("-m must be a number of milliseconds");
+            if (result.max_evaluation_ms < 0)
+                cli.fatal("-m must be 0 (disabled) or a positive number of milliseconds");
         } else {
             cli.fatal("unknown argument");
         }
@@ -172,6 +184,14 @@ pub fn main() !void {
 
     // Step 3, as in onEom: policy discovery and the Organizational Domain both
     // come from one tree walk starting at the Author Domain (RFC 9989 §4.10).
+    //
+    // X-21: the daemon's budget applies here too, checked before each
+    // DNS-spending step.
+    const deadline = deadline_mod.Deadline.fromNow(args.max_evaluation_ms);
+    if (deadline.expired()) {
+        emitAll("temperror", "none", "", "", "", false, "", false);
+        return;
+    }
     var author_walk = treewalk.walk(allocator, &resolver, from_domain) catch {
         emitAll("temperror", "none", "", "", "", false, "", false);
         return;
@@ -218,8 +238,16 @@ pub fn main() !void {
     var spf_ident = alignment.Identifier{ .domain = args.mailfrom, .result = args.spf };
     var dkim_ident = alignment.Identifier{ .domain = args.dkim, .result = args.dkim_result };
 
+    if (deadline.expired()) {
+        emitAll("temperror", "none", "", "", "", false, "", false);
+        return;
+    }
     var spf_walk = treewalk.orgWalk(allocator, &resolver, rec.aspf, from_domain, from_org, &spf_ident, psl_ptr);
     defer if (spf_walk) |*w| w.deinit();
+    if (deadline.expired()) {
+        emitAll("temperror", "none", "", "", "", false, "", false);
+        return;
+    }
     var dkim_walk = treewalk.orgWalk(allocator, &resolver, rec.adkim, from_domain, from_org, &dkim_ident, psl_ptr);
     defer if (dkim_walk) |*w| w.deinit();
 
