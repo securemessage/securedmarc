@@ -200,6 +200,7 @@ fn runDaemon() !void {
         .worker_threads = dmarc_cfg.worker_threads,
         .max_connections = dmarc_cfg.max_connections,
         .num_listeners = @intCast(dmarc_cfg.listen_addresses.len),
+        .listen_addresses = dmarc_cfg.listen_addresses,
         .spawn_threads = spawnHealthMonitor,
     });
     defer boot.deinit();
