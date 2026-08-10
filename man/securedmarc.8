@@ -134,6 +134,9 @@ Default: unset.
 Number of worker threads.
 0 means auto-detect CPU count.
 Default: 0.
+.It Cm MaxConnections
+Maximum simultaneous connections per worker.
+Default: 256.
 .It Cm PidFile
 Path to the PID file.
 Default:
@@ -240,6 +243,23 @@ Default: 20000.
 Exhausting the budget yields temperror, never fail: the message was not
 judged, and the sender retries.
 A slow resolver, not a hostile sender, is what it guards against.
+.It Cm ApplyPct
+Whether a published
+.Cm pct=
+is honoured.
+Default: no.
+.Pp
+RFC 9989 Appendix A.6 removed
+.Cm pct=
+in favor of
+.Cm t= ,
+so ignoring it is what the current spec says and is the default here.
+Enable this only while senders who have published
+.Cm pct=
+but not yet moved to
+.Cm t=
+still need a partial rollout honoured; it is a transition aid, not a
+recommended long-term setting.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.

@@ -53,10 +53,14 @@ securedmarc -c /usr/local/etc/securedmarc/securedmarc.conf
 | Option | Default | Description |
 |--------|---------|-------------|
 | `AuthservID` | `localhost` | A-R header identifier (must match SPF/DKIM) |
+| `StripAuthResults` | `no` | Remove pre-existing Authentication-Results headers claiming our `AuthservID`; enable only where no other SecureMilter daemon precedes this one |
+| `PublicSuffixList` | *(unset)* | Path to a Public Suffix List file, used only to veto a DNS tree-walk result. Deprecated, expected to be removed once `psd=` is widely deployed |
 | `WorkerThreads` | `0` (auto) | Worker thread count (0 = CPU count) |
+| `MaxConnections` | `256` | Max simultaneous connections per worker |
 | `PidFile` | `/var/run/securedmarc/securedmarc.pid` | PID file path |
 | `Foreground` | `no` | Run in foreground (no daemonize) |
 | `User` | *(none)* | Drop privileges to this user |
+| `UMask` | *(inherited)* | File-creation mask (octal) for the PID file and any unix-domain listener |
 | `Syslog` | `yes` | Enable syslog output |
 | `SyslogFacility` | `mail` | Syslog facility |
 | `LogLevel` | `info` | Log level: err, warn, info, debug |
@@ -65,6 +69,10 @@ securedmarc -c /usr/local/etc/securedmarc/securedmarc.conf
 | `DnsRetries` | `2` | DNS retry count |
 | `DnsCacheSize` | `1000` | Per-worker DNS cache max entries |
 | `DnsNegativeTTL` | `60` | Negative cache TTL in seconds |
+| `MaxHeaders` | `500` | Largest number of headers accumulated per message; 0 disables the limit |
+| `MaxHeaderBytes` | `1M` | Largest total header size per message; 0 disables the limit |
+| `MaxEvaluationMs` | `20000` | Wall-clock ceiling for evaluating one message; 0 disables it |
+| `ApplyPct` | `no` | Honor a published deprecated `pct=` tag (RFC 9989 transition aid) |
 | `ZmqEndpoint` | *(disabled)* | ZMQ PUB endpoint |
 | `ZmqTopic` | `dmarc.evaluation` | ZMQ topic prefix |
 
