@@ -416,22 +416,8 @@ fn oneLevelDown(p: Policy) Policy {
 
 /// Is this message inside the `pct=` sample?
 ///
-/// RFC 7489 §6.6.4 requires only that no more than `pct` percent of affected
-/// messages have the policy enacted, and §6.3 offers `random mod 100 < pct` as
-/// "adequate". We hash the Message-ID instead, and the reason is operational
-/// rather than cryptographic: a random draw gives the *same* message a fresh
-/// verdict on every delivery attempt, so a message quarantined on the first try
-/// can walk through on the retry that follows a temporary failure. Sampling that
-/// a sender can re-roll by retrying is not a rollout control. Hashing an
-/// identifier the message carries makes the decision stable for that message
-/// while staying uniform across a mail stream, which is what §6.6.4 actually
-/// asks for -- "a close approximation to the requested percentage" and "a
-/// representative sample".
-///
-/// A message with no Message-ID is treated as selected. The alternative -- a
-/// blanket exemption -- would make omitting one header a way to opt out of a
-/// domain's enforcement, and a missing Message-ID is exactly what a bulk forger
-/// is likely to produce.
+/// Hashing Message-ID keeps a message's sampling decision stable across retries.
+/// Messages without one are selected so omitting the header cannot bypass policy.
 pub fn inSample(pct: u8, message_id: ?[]const u8) bool {
     if (pct >= 100) return true;
     if (pct == 0) return false;

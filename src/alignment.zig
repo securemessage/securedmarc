@@ -94,8 +94,7 @@ test "relaxed alignment compares organizational domains" {
 }
 
 test "relaxed alignment does not collapse public suffixes" {
-    // The M-2 bypass: under the old last-two-labels rule both sides reduced to
-    // "co.uk". With tree-walk organizational domains they stay distinct.
+    // Tree-walk organizational domains keep separate `co.uk` registrants distinct.
     try std.testing.expect(!isAligned(
         "a.victim.co.uk",
         "victim.co.uk",

@@ -87,10 +87,8 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
     const zmq_endpoint = global.get("ZmqEndpoint");
     const zmq_topic = global.getOrDefault("ZmqTopic", "dmarc.evaluation");
 
-    // Trust boundary. Off by default: DMARC reads the spf= and dkim= results
-    // that SecureSPF and SecureDKIM added earlier in the same milter chain, and
-    // those carry our authserv-id too. Only enable where no other SecureMilter
-    // daemon precedes this one.
+    // Leave prior local SPF and DKIM results available unless this is the first
+    // SecureMilter daemon in the chain.
     const strip_auth_results = global.getBool("StripAuthResults", false);
 
     // `pct=` was removed by RFC 9989 §A.6 in favour of `t=`, so the default is to

@@ -172,9 +172,7 @@ test "duplicate rules are stored once" {
 }
 
 test "duplicate rules differing only in case are stored once" {
-    // Both orderings: the second insert must be recognised as a repeat rather
-    // than allocating a key that `put` would then discard. std.testing's
-    // allocator fails the test if that key leaks.
+    // Case normalization must precede duplicate detection to avoid leaked keys.
     var lower_first = PublicSuffixList.init(std.testing.allocator);
     defer lower_first.deinit();
     try lower_first.loadText("co.uk\nCO.UK\nCo.Uk\n");
