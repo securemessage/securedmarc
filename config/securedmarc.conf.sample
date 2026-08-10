@@ -118,11 +118,11 @@ ZmqTopic        = dmarc.evaluation
 # Loopback. "inbound" describes the mail, not this socket: the client is always the
 # local Postfix. The milter protocol has no authentication, and this daemon decides
 # disposition -- anything that can reach this port feeds it an Authentication-Results
-# it will believe, which is finding M-1/X-1 without forging a header, and under
-# p=reject it decides what gets bounced. Widen only if Postfix genuinely runs on
-# another machine, and then restrict it with pf.
+# it will believe, without forging a header, and under p=reject it decides what
+# gets bounced. Widen only if Postfix genuinely runs on another machine, and then
+# restrict it with pf.
 
-# --- Evaluation time budget (X-21) ---
+# --- Evaluation time budget ---
 #
 # MaxEvaluationMs is the wall-clock ceiling in milliseconds for evaluating one
 # message, shared by every DNS lookup the verdict needs. Exhausting it gives
@@ -132,7 +132,7 @@ ZmqTopic        = dmarc.evaluation
 # 0 disables it. Takes effect at startup; SIGHUP does not pick up a change.
 # MaxEvaluationMs = 20000
 
-# Whether a published pct= is honoured (audit M-4). Default: no.
+# Whether a published pct= is honoured. Default: no.
 #
 # RFC 9989 Appendix A.6 removed pct= in favor of t=, so ignoring it is what the
 # current spec says and is the default here. Enable this only while senders
@@ -144,6 +144,6 @@ ZmqTopic        = dmarc.evaluation
 [listener:inbound]
 # The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
 # configuration ERROR, not a synonym for 127.0.0.1. A Socket value that cannot be
-# parsed stops startup and names this section (X-14); it is never silently ignored
-# and never falls back to the default listener.
+# parsed stops startup and names this section; it is never silently ignored and
+# never falls back to the default listener.
 Socket          = inet:8894@127.0.0.1
