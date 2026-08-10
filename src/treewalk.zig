@@ -10,18 +10,10 @@ const dmarc = @import("dmarc.zig");
 const psl_mod = @import("psl.zig");
 const alignment = @import("alignment.zig");
 
-/// RFC 9989 §4.10 DNS Tree Walk.
+/// RFC 9989 §4.10 DNS tree walk.
 ///
-/// DMARC needs the boundary between the labels a registry controls and the
-/// labels a registrant controls. RFC 7489 outsourced that question to the
-/// Public Suffix List; RFC 9989 answers it from the DNS itself by walking up
-/// the hierarchy looking for DMARC policy records, with the psd= tag letting
-/// a zone state which side of the boundary it is on.
-///
-/// The walk is bounded: at most MAX_QUERIES lookups, and domains with eight or
-/// more labels are shortened to seven before walking, so a sender cannot force
-/// unbounded DNS work with a deeply nested Author Domain.
-/// RFC 9989 §4.10: eight queries maximum.
+/// It discovers DMARC policy records and the organizational-domain boundary.
+/// The walk is limited to `MAX_QUERIES` DNS lookups.
 pub const MAX_QUERIES: usize = 8;
 
 /// Label count at which the walk stops removing labels one at a time.
@@ -66,32 +58,17 @@ pub const Walk = struct {
         return self.found.items[self.found.items.len - 1].record;
     }
 
-    /// The name `policyRecord` took its record from -- the policy domain.
-    ///
-    /// Paired with `policyRecord` so the "which name won" rule lives in exactly
-    /// one place. `securedmarc-check` reports it, and a caller that wants to log
-    /// which domain's policy it applied can use it without reaching into `found`
-    /// and re-deriving the selection.
+    /// Domain that supplied `policyRecord`, if any.
     pub fn policyDomain(self: *const Walk) ?[]const u8 {
         if (self.found.items.len == 0) return null;
         return self.found.items[self.found.items.len - 1].domain;
     }
 };
 
-/// Establish an authenticated identifier's Organizational Domain, if that is
-/// what alignment will actually compare.
+/// Establish an identifier's organizational domain for relaxed alignment.
 ///
-/// Returns the walk so the caller can keep it alive: `ident.org_domain` points
-/// into it. Null when no walk was needed -- strict alignment compares domains
-/// directly, an identifier that did not pass cannot align anyway, and an
-/// identifier equal to the Author Domain already shares its boundary
-/// (RFC 9989 §4.10.2, "There is no need to perform Identifier Alignment
-/// Evaluations under any of the following conditions").
-///
-/// Lives here rather than in the milter because `securedmarc-check` needs the
-/// same three skip conditions. Two copies would let a conformance result speak
-/// about the checker's version of alignment instead of the shipped one, which is
-/// the failure mode the external-oracle gate exists to prevent.
+/// Returns the owning walk when one was needed because `ident.org_domain` borrows
+/// from it. Strict mode, failed identifiers, and exact-domain matches need none.
 pub fn orgWalk(
     allocator: Allocator,
     resolver: *dns_mod.Resolver,
@@ -157,14 +134,9 @@ pub fn walk(
     return result;
 }
 
-/// Determine the Organizational Domain from a completed walk
-/// (RFC 9989 §4.10.2), optionally vetoed by a Public Suffix List.
+/// Determine the organizational domain from a completed RFC 9989 walk.
 ///
-/// The list is advisory: the tree walk decides, and the list may only reject a
-/// boundary that is demonstrably a public suffix. It exists because rule 3
-/// below trusts that a public suffix which publishes DMARC also publishes
-/// psd=y; a registry that forgets the tag would otherwise be selected as an
-/// Organizational Domain, which is precisely the collapse the PSL prevented.
+/// An optional Public Suffix List can veto, but not select, a boundary.
 pub fn organizationalDomain(w: *const Walk, psl: ?*const psl_mod.PublicSuffixList) []const u8 {
     // Rule 1: an explicit psd=n names the Organizational Domain outright.
     // Examined longest name first, as the RFC specifies.

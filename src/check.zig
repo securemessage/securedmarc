@@ -1,27 +1,8 @@
-//! `securedmarc-check` — evaluate DMARC for one set of identifiers and print the
-//! result, so an external conformance suite can drive the shipped evaluator.
+//! `securedmarc-check` evaluates DMARC identifiers through the daemon's policy,
+//! tree-walk, alignment, and disposition functions.
 //!
-//! Exists for the same reason `securespf-check` and `securearc-check` do: RFC
-//! conformance is a V1 release gate, and a gate is only meaningful if the thing
-//! under test is the code that ships. The suite this serves is built from
-//! RFC 9989's own worked examples in Appendix B, which state expected
-//! Organizational Domains, alignment outcomes and — in §4.10 and B.4.2 — the
-//! exact sequence of DNS queries a tree walk must make.
-//!
-//! It takes identifiers rather than a message on purpose. DMARC's inputs are the
-//! RFC5322.From domain plus the SPF and DKIM results that earlier milters in the
-//! chain already established, and `securedmarc` reads those from
-//! `Authentication-Results` headers. Reconstructing them from a message would
-//! mean reimplementing SPF and DKIM inside the checker, which is precisely the
-//! parallel implementation the gate is meant to rule out. Appendix B specifies
-//! the identifiers directly, so that is the interface.
-//!
-//! The evaluation below is the same sequence `main.zig`'s `onEom` performs, in
-//! the same order, calling the same functions: `treewalk.walk`,
-//! `Walk.recordAtStart`/`policyRecord`, `DmarcRecord.applicability`,
-//! `treewalk.organizationalDomain`, `treewalk.orgWalk`, `dmarc.evaluate` and
-//! `dmarc.getDisposition`. `onEom` itself is not reused only because it needs a
-//! live milter `Connection`.
+//! Its identifier inputs match the SPF and DKIM results consumed from
+//! Authentication-Results by the milter flow.
 
 const std = @import("std");
 const mem = std.mem;
@@ -82,8 +63,7 @@ const Args = struct {
     psl_path: ?[]const u8 = null,
     nameserver: []const u8 = "127.0.0.1",
     port: u16 = 53,
-    /// The daemon's MaxEvaluationMs (X-21), on the CLI so the tool answers the
-    /// question the daemon answers.
+    /// Evaluation deadline matching the daemon's `MaxEvaluationMs`.
     max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS,
 };
 
@@ -129,9 +109,7 @@ fn parseArgs(allocator: Allocator) !Args {
     return result;
 }
 
-/// Print one `key=value` line. Absent values print as an empty value rather than
-/// being omitted, so a consumer can tell "walked, got nothing" from "never
-/// asked" only by the key's presence, and every run yields the same key set.
+/// Print one `key=value` line; absent values remain present with empty values.
 fn emit(key: []const u8, value: []const u8) void {
     cli.out(key);
     cli.out("=");
@@ -182,11 +160,8 @@ pub fn main() !void {
     }
     const psl_ptr: ?*const psl_mod.PublicSuffixList = if (psl) |*p| p else null;
 
-    // Step 3, as in onEom: policy discovery and the Organizational Domain both
-    // come from one tree walk starting at the Author Domain (RFC 9989 §4.10).
-    //
-    // X-21: the daemon's budget applies here too, checked before each
-    // DNS-spending step.
+    // One tree walk discovers policy and the Author Domain's organizational
+    // boundary (RFC 9989 §4.10).
     const deadline = deadline_mod.Deadline.fromNow(args.max_evaluation_ms);
     if (deadline.expired()) {
         emitAll("temperror", "none", "", "", "", false, "", false);

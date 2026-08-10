@@ -1,8 +1,4 @@
-//! SecureDMARC message flow: everything that runs per message.
-//!
-//! Split out of `main.zig` at stage 4.2, matching `securearc` and the split
-//! `securedkim` took at 4.1. `main.zig` keeps the globals, the bootstrap and
-//! the reload; this file evaluates a message and stamps the verdict on it.
+//! Per-message SecureDMARC evaluation, stamping, and event publishing.
 
 const std = @import("std");
 const mem = std.mem;
@@ -25,12 +21,7 @@ const treewalk = @import("treewalk.zig");
 const psl = @import("psl.zig");
 const upstream = @import("upstream.zig");
 
-/// What the flow reads from the daemon's configuration, gathered once per message.
-///
-/// `main.zig` owns the globals these come from and sets them all before the
-/// worker pool spawns. Collecting them at one point per message is what keeps
-/// the flow from reading module state at a dozen scattered places, where a
-/// reload landing mid-message could have shown it two different configurations.
+/// Per-message configuration used by the flow.
 pub const MsgCtx = struct {
     authserv_id: []const u8,
     strip_policy: header_scrub.StripPolicy,
@@ -40,16 +31,7 @@ pub const MsgCtx = struct {
     /// workers -- so carrying the pointer is safe. Null when none is configured.
     psl: ?*const psl.PublicSuffixList,
 
-    /// ACCESSORS, NOT POINTERS, and deliberately so.
-    ///
-    /// Both providers in `main.zig` lazily construct a threadlocal on first
-    /// call: the resolver builds a TTL cache, the publisher opens a ZMQ socket.
-    /// A message can finish before either is wanted -- a second `From` field, a
-    /// missing `From` domain, or no DMARC record at all each return before the
-    /// publish, and the first two before any DNS. Holding them as fields would
-    /// mean constructing both on every worker that ever saw a message, which is
-    /// a behaviour change and not one worth smuggling into a file move. Same
-    /// choice, for the same reason, as `securespf` and `securedkim`.
+    /// Lazy per-thread resolver and publisher accessors.
     resolver: *const fn () *dns_mod.Resolver,
     publisher: *const fn () *zmq.Publisher,
     /// Wall-clock bound on one message's evaluation, in ms; 0 disables (X-21).
@@ -59,14 +41,7 @@ pub const MsgCtx = struct {
     max_evaluation_ms: i64,
 };
 
-/// How many DKIM results from `Authentication-Results` are evaluated.
-///
-/// Every relaxed-mode identifier that passed can cost one DNS tree walk, and
-/// the number of `dkim=` results in the header is chosen by whoever sent the
-/// message. The cap is the same reasoning as the other content limits (audit
-/// X-4): bound work that an attacker gets to size. Ten is far above what real
-/// mail carries — a message with more aligned candidates than this is not one
-/// whose eleventh signature decides the verdict.
+/// Maximum DKIM results evaluated from Authentication-Results.
 const MAX_DKIM_IDENTIFIERS = 10;
 
 /// End-of-message: scrub forged claims, evaluate, and log the verdict.

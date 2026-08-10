@@ -9,20 +9,9 @@ const header_scrub = securemilter.header_scrub;
 
 const alignment = @import("alignment.zig");
 
-/// Reading the authentication results produced earlier in this milter chain.
+/// Collect trusted upstream SPF and DKIM authentication results.
 ///
-/// DMARC does not authenticate anything itself: it reads the SPF and DKIM
-/// results that upstream milters recorded in `Authentication-Results` and asks
-/// whether either aligns with the Author Domain. That makes this the point
-/// where a forged or misread header becomes a DMARC verdict, so it is worth
-/// keeping separate from the milter plumbing and testing directly.
-///
-/// The rule that matters (audit M-6): **a result and the properties describing
-/// it are one unit.** Collecting `dkim=` verdicts with one scan and `header.d=`
-/// domains with another lets a `pass` earned by one signature be paired with a
-/// domain named by a different one — or by no signature at all, if the text sat
-/// inside a comment. Everything here is built per result, from that result's
-/// own property span.
+/// Each DKIM result remains paired with properties from its own result span.
 pub const Upstream = struct {
     /// The first `spf=` result found, if any.
     spf_result: ?[]const u8 = null,
@@ -42,16 +31,10 @@ pub const Upstream = struct {
     }
 };
 
-/// Collect the upstream results from every A-R header claiming `authserv_id`.
+/// Collect results from A-R headers claiming `authserv_id`.
 ///
-/// `max_dkim` bounds the identifiers returned. The count of `dkim=` results in
-/// a header is chosen by whoever sent the message, and each relaxed-mode
-/// identifier that passed can cost a DNS tree walk later, so this is the same
-/// reasoning as the other content caps (audit X-4).
-///
-/// Allocation failure yields a shorter list rather than an error: a DMARC
-/// verdict computed from fewer identifiers is conservative — it can only fail
-/// to find an alignment, never invent one.
+/// `max_dkim` bounds later identifier tree walks; allocation failure conservatively
+/// produces a shorter candidate list.
 pub fn collect(
     allocator: Allocator,
     headers: []const connection_mod.Header,
