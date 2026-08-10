@@ -47,6 +47,11 @@ AuthservID      = mail.example.com
 PublicSuffixList = /usr/local/share/public_suffix_list/public_suffix_list.dat
 
 WorkerThreads   = 0
+
+# Maximum simultaneous connections accepted by each worker thread.
+# Default: 256.
+# MaxConnections = 256
+
 Foreground      = no
 PidFile         = /var/run/securedmarc/securedmarc.pid
 
@@ -76,11 +81,22 @@ User            = _dmarc
 # UMask         = 0117
 Syslog          = yes
 SyslogFacility  = mail
+
+# Logging verbosity: err, warn, info, debug.
+# LogLevel      = info
+
 DnsNameserver   = 127.0.0.1
 DnsTimeout      = 5
 DnsRetries      = 2
+
+# Maximum entries in the per-worker DNS cache, and the TTL in seconds applied
+# to negative answers (NXDOMAIN, SERVFAIL) so a lookup that just failed is not
+# retried on every message.
+# DnsCacheSize    = 1000
+# DnsNegativeTTL  = 60
+
 ZmqEndpoint     = tcp://events.internal:5555
-ZmqTopic        = dmarc
+ZmqTopic        = dmarc.evaluation
 
 # --- Resource limits on attacker-controlled message content ---
 #
@@ -115,6 +131,15 @@ ZmqTopic        = dmarc
 #
 # 0 disables it. Takes effect at startup; SIGHUP does not pick up a change.
 # MaxEvaluationMs = 20000
+
+# Whether a published pct= is honoured (audit M-4). Default: no.
+#
+# RFC 9989 Appendix A.6 removed pct= in favor of t=, so ignoring it is what the
+# current spec says and is the default here. Enable this only while senders
+# who have published pct= but not yet moved to t= still need a partial
+# rollout honoured; it is a transition aid, not a recommended long-term
+# setting.
+# ApplyPct      = no
 
 [listener:inbound]
 # The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
