@@ -24,16 +24,15 @@ SecureDMARC evaluates DMARC policies by reading upstream SPF and DKIM Authentica
 # Build
 zig build
 
-# Create user and directories
-pw useradd _dmarc -d /nonexistent -s /usr/sbin/nologin
+# Create directories (mailnull is the shared FreeBSD milter account other
+# milters already run as -- no dedicated user needed)
 mkdir -p /var/run/securedmarc /usr/local/etc/securedmarc
-chown _dmarc:_dmarc /var/run/securedmarc
 
 # Write config
 cat > /usr/local/etc/securedmarc/securedmarc.conf << 'EOF'
 [global]
 AuthservID      = mail.example.com
-User            = _dmarc
+User            = mailnull
 PidFile         = /var/run/securedmarc/securedmarc.pid
 DnsNameserver   = 127.0.0.1
 
