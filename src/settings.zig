@@ -174,11 +174,11 @@ test "a listener section with no Socket is refused" {
     try std.testing.expectError(error.MissingListenerSocket, parseDmarcConfig(std.testing.allocator, &cfg));
 }
 
-// L-2: `MaxConnections` was read by `securespf` and ignored here, so an operator
-// who set it on this daemon got 256 and no diagnostic. The value has two
-// consumers -- the accept-path cap and the RLIMIT_NOFILE calculation -- and
-// wiring only one of them would raise the fd budget without raising the limit
-// that budget was sized for, or the reverse.
+// L-2: `MaxConnections` must be honoured here the same way every daemon
+// honours it, or an operator gets no diagnostic for a value that appears to do
+// nothing. The value has two consumers -- the accept-path cap and the
+// RLIMIT_NOFILE calculation -- and wiring only one of them would raise the fd
+// budget without raising the limit that budget was sized for, or the reverse.
 test "L-2: MaxConnections is honoured, and defaults when absent" {
     {
         var cfg = try config_mod.parse(std.testing.allocator,
@@ -210,13 +210,11 @@ test "L-2: MaxConnections is honoured, and defaults when absent" {
     }
 }
 
-// The implicit listener binds loopback, never 0.0.0.0.
-//
-// Until 2026-07-29 it bound 0.0.0.0 and nothing tested it. This daemon decides
-// disposition, so a reachable port lets an attacker supply a message whose
-// Authentication-Results it will believe -- M-1/X-1 without forging a header -- and
-// under p=reject it decides what gets bounced. The milter protocol authenticates
-// nobody, so reachability IS authorization.
+// The implicit listener binds loopback, never 0.0.0.0: this daemon decides
+// disposition, so a reachable port would let an attacker supply a message whose
+// Authentication-Results it will believe -- M-1/X-1 without forging a header --
+// and under p=reject it decides what gets bounced. The milter protocol
+// authenticates nobody, so reachability IS authorization.
 test "the implicit listener binds loopback, not every interface" {
     const ini_text =
         \\[global]
@@ -280,13 +278,11 @@ test "M-4: ApplyPct can be turned on" {
 // A safe default, not a policy override: an operator whose Postfix runs in another
 // jail must still be able to ask for a routable socket.
 //
-// This asserts the host explicitly. It previously checked only that the config
-// parsed and that one listener came back, which would still have passed if an
-// over-zealous "harden the listener" change had rewritten the operator's 0.0.0.0
-// to loopback -- the exact regression the test exists to catch. A test whose name
-// promises more than its assertions deliver is worse than an absent one, because
-// it reads as covered. `cfg` is kept alive across the assertion because a host from
-// a `Socket =` line borrows from it.
+// The host is asserted explicitly rather than merely checking that the config
+// parsed and one listener came back, so an over-zealous "harden the listener"
+// change that rewrote the operator's 0.0.0.0 to loopback would fail this test.
+// `cfg` is kept alive across the assertion because a host from a `Socket =`
+// line borrows from it.
 test "parse config minimal, and an explicit 0.0.0.0 socket is still honoured" {
     const ini_text =
         \\[global]

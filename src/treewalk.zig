@@ -187,15 +187,12 @@ fn lookup(allocator: Allocator, resolver: *dns_mod.Resolver, domain: []const u8)
     var res = resolver.resolve(qname, .TXT) catch |err| {
         // An authoritative "no such name" is not a failure here, it is the
         // answer: almost every step of a tree walk asks about a `_dmarc` name
-        // that does not exist. Reporting it as transient latched
+        // that does not exist. Reporting it as transient would latch
         // `transient_error` on the walk, and since the flag is only consulted
-        // when nothing was found anywhere, the visible effect was
-        // `dmarc=temperror` for every domain that publishes no DMARC record —
-        // which is most of them.
-        //
-        // The resolver could not express the difference until NegativeKind
-        // existed; `transient_error` has always been documented as meaning
-        // "failed in a way that is not 'no such record'".
+        // when nothing was found anywhere, that would report `dmarc=temperror`
+        // for every domain that publishes no DMARC record -- which is most of
+        // them. `transient_error` means "failed in a way that is not 'no such
+        // record'".
         if (dns_mod.isTransientError(err)) return .transient;
         return .absent;
     };
@@ -214,10 +211,9 @@ fn lookup(allocator: Allocator, resolver: *dns_mod.Resolver, domain: []const u8)
 /// A named type rather than two locals because "a record" here means precisely
 /// "text with a current `v=DMARC1`" — including a record whose `p=` is missing
 /// or invalid, which §4.10.1 handles separately and which therefore still
-/// counts towards the ambiguity test. While `parseRecord` returned null for a
-/// missing `p=`, a name publishing `v=DMARC1; rua=...` alongside
-/// `v=DMARC1; p=reject` counted one record and applied the `p=reject`, silently
-/// resolving an ambiguity the RFC says to refuse.
+/// counts towards the ambiguity test. A name publishing `v=DMARC1; rua=...`
+/// alongside `v=DMARC1; p=reject` must count as two records and be discarded
+/// as ambiguous, not resolved by picking the one with a usable `p=`.
 const RecordSelector = struct {
     record: ?dmarc.DmarcRecord = null,
     count: usize = 0,
@@ -318,9 +314,9 @@ test "4.10 step 2: exactly one record at a name, or none" {
     };
     try std.testing.expect(two.selected() == null);
 
-    // The case the parseRecord contract change made reachable: a record with no
-    // usable p= still counts, so this name is ambiguous rather than resolving
-    // to the p=reject. Non-DMARC TXT records alongside it are still ignored.
+    // A record with no usable p= still counts, so this name is ambiguous
+    // rather than resolving to the p=reject. Non-DMARC TXT records alongside
+    // it are still ignored.
     const ambiguous_via_unusable = blk: {
         var s = RecordSelector{};
         s.offer("v=DMARC1; rua=mailto:d@example.com");
