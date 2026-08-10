@@ -1,0 +1,153 @@
+.\" Copyright (c) 2026 Daniel Morante
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd July 27, 2026
+.Dt SECUREDMARC-CHECK 8
+.Os
+.Sh NAME
+.Nm securedmarc-check
+.Nd command-line DMARC policy evaluation tool
+.Sh SYNOPSIS
+.Nm
+.Fl -from Ar domain
+.Op Fl -mailfrom Ar domain
+.Op Fl -spf Ar result
+.Op Fl -dkim Ar domain
+.Op Fl -dkim-result Ar result
+.Op Fl -psl Ar file
+.Op Fl n Ar nameserver
+.Op Fl p Ar port
+.Op Fl m Ar ms
+.Sh DESCRIPTION
+.Nm
+evaluates DMARC for a set of already-authenticated identifiers and prints
+the outcome as
+.Dq key=value
+lines on standard output.
+It calls the same policy, DNS tree-walk, alignment, and disposition
+functions
+.Xr securedmarc 8
+calls, so a result from
+.Nm
+is a statement about the shipped evaluator rather than about a separate
+implementation written to pass tests.
+.Pp
+Unlike
+.Xr securearc-check 8
+and
+.Xr securedkim-check 8 ,
+.Nm
+does not parse a message file.
+Its inputs are the SPF and DKIM identifiers and results the milter chain
+would have already placed in Authentication-Results headers by the time
+.Xr securedmarc 8
+runs, so they are given directly on the command line.
+.Sh OPTIONS
+.Bl -tag -width indent
+.It Fl -from Ar domain
+Author Domain
+.Pq RFC5322.From .
+Required.
+.It Fl -mailfrom Ar domain
+RFC5321.MailFrom domain, the SPF identifier.
+.It Fl -spf Ar result
+SPF result:
+.Dq pass , Dq fail , Dq none ,
+etc.
+Default:
+.Dq none .
+.It Fl -dkim Ar domain
+DKIM Authenticated Identifier, the signature's
+.Cm d=
+value.
+.It Fl -dkim-result Ar result
+DKIM result:
+.Dq pass , Dq fail , Dq none ,
+etc.
+Default:
+.Dq none .
+.It Fl -psl Ar file
+Public Suffix List file, used only to veto a DNS tree-walk result, exactly as
+the deprecated
+.Cm PublicSuffixList
+option in
+.Xr securedmarc 8
+does.
+.It Fl n Ar nameserver
+DNS nameserver IP address.
+Default:
+.Dq 127.0.0.1 .
+.It Fl p Ar port
+DNS nameserver port.
+Default: 53.
+.It Fl m Ar ms
+Wall-clock budget for the evaluation, in milliseconds.
+Default: 20000, matching the daemon's
+.Cm MaxEvaluationMs .
+0 disables the limit.
+.It Fl h
+Display usage information.
+.El
+.Sh OUTPUT
+.Bl -tag -width "policy_domain" -compact
+.It Cm result
+DMARC result:
+.Dq pass , Dq fail , Dq none , Dq temperror ,
+or
+.Dq permerror .
+.It Cm disposition
+Policy to apply:
+.Dq none , Dq quarantine ,
+or
+.Dq reject .
+.It Cm policy_domain
+Name whose DMARC record supplied the policy.
+.It Cm from_org
+Organizational Domain of the Author Domain.
+.It Cm spf_org
+Organizational Domain of the SPF identifier, if walked.
+.It Cm spf_aligned
+.Dq yes
+or
+.Dq no .
+.It Cm dkim_org
+Organizational Domain of the DKIM identifier, if walked.
+.It Cm dkim_aligned
+.Dq yes
+or
+.Dq no .
+.El
+.Sh EXIT STATUS
+.Bl -tag -width indent -compact
+.It 0
+A verdict was reached and printed to standard output, including
+.Dq fail .
+.It 2
+The tool could not run:
+.Fl -from
+was not given, an option was invalid, or the Public Suffix List file could
+not be loaded.
+.El
+.Sh EXAMPLES
+Evaluate a message that passed both SPF and DKIM, aligned:
+.Bd -literal -offset indent
+securedmarc-check --from example.com --mailfrom example.com --spf pass \e
+    --dkim example.com --dkim-result pass
+.Ed
+.Pp
+Evaluate a message with only DKIM alignment, against a conformance suite's
+own zone:
+.Bd -literal -offset indent
+securedmarc-check --from example.com --dkim example.com --dkim-result pass \e
+    -n 127.0.0.1 -p 5353
+.Ed
+.Sh SEE ALSO
+.Xr securedmarc 8 ,
+.Xr securespf 8 ,
+.Xr securedkim 8
+.Sh STANDARDS
+.Rs
+.%T Domain-based Message Authentication, Reporting, and Conformance (DMARC)
+.%R RFC 7489
+.Re
+.Sh AUTHORS
+.An Daniel Morante
