@@ -18,26 +18,12 @@ pub const Identifier = struct {
     org_domain: ?[]const u8 = null,
     /// The method result as reported by the milter that produced it.
     result: ?[]const u8 = null,
-    /// The producing milter marked this result as coming from a key its owner
-    /// published in testing mode (audit D-11). DKIM only; always false for SPF.
-    ///
-    /// Kept beside `result` rather than replacing it, because the two answer
-    /// different questions. `result` is what the verifier found, which the A-R
-    /// still reports truthfully; this says the finding must not be acted upon.
+    /// Whether a DKIM `t=y` key produced this result; always false for SPF.
     testing: bool = false,
 
-    /// Did this identifier authenticate, for the purpose of *deciding* something?
+    /// Whether this identifier can authenticate a policy decision.
     ///
-    /// A `t=y` result is excluded here rather than at the point it was parsed,
-    /// so it stays visible to logging and to the operator's identifier count
-    /// while being inert to every decision. RFC 6376 §3.6.1: verifiers "MUST NOT
-    /// treat messages from Signers in testing mode differently from unsigned
-    /// email, even should the signature fail to verify." Letting a testing key
-    /// produce an aligned DKIM pass would give it a *better* outcome than
-    /// unsigned mail, which is the exact differential treatment forbidden.
-    ///
-    /// This is the one gate: `evaluate` and `alignedDkim` both route through it,
-    /// so neither can reach a different conclusion about the same signature.
+    /// Results from testing keys remain visible but never satisfy this predicate.
     pub fn passed(self: Identifier) bool {
         if (self.testing) return false;
         const r = self.result orelse return false;
@@ -45,16 +31,10 @@ pub const Identifier = struct {
     }
 };
 
-/// Check if an authenticated identifier aligns with the RFC5322.From domain.
+/// Whether an authenticated identifier aligns with the RFC5322.From domain.
 ///
-/// - Strict: exact case-insensitive match of the domains themselves.
-/// - Relaxed: the two Organizational Domains must match.
-///
-/// Organizational Domains are supplied by the caller rather than derived here.
-/// They come from a DNS tree walk, because the registry/registrant boundary is
-/// not something that can be computed from a domain name: counting labels gets
-/// `victim.co.uk` and `attacker.co.uk` wrong in a way that aligns unrelated
-/// registrants with each other.
+/// Strict mode compares domains; relaxed mode compares caller-supplied
+/// organizational domains from the DNS tree walk.
 pub fn isAligned(
     from_domain: []const u8,
     from_org: []const u8,

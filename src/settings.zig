@@ -1,9 +1,4 @@
-//! SecureDMARC configuration: the shape of the parsed config and the parser.
-//!
-//! Split out of `main.zig` at stage 4.2, matching `securearc` and the split
-//! `securedkim` took at 4.1. Everything an operator can set in the INI file
-//! lands here; `main.zig` copies the parts the workers read into its globals
-//! before the pool spawns, and `flow.zig` sees them only through a `MsgCtx`.
+//! SecureDMARC configuration parsing and runtime configuration.
 
 const std = @import("std");
 const mem = std.mem;
@@ -21,14 +16,7 @@ pub const DmarcConfig = struct {
     authserv_id: []const u8,
     listen_addresses: []const listener_mod.ListenAddress,
     worker_threads: u32,
-    /// Per-worker cap on simultaneous connections, enforced in the accept path.
-    ///
-    /// No default on this field on purpose. It reached the worker as a hard-coded
-    /// `DEFAULT_MAX_CONNECTIONS` while `MaxConnections` was already read by
-    /// `securespf`, so the same key was honoured by one daemon and silently ignored
-    /// by this one (audit L-2). A field that quietly supplies a constant when the
-    /// caller forgets to set it is how that happens, so every construction site
-    /// states it.
+    /// Per-worker connection cap enforced by the accept path.
     max_connections: u32,
     pid_file: []const u8,
     foreground: bool,
@@ -48,9 +36,7 @@ pub const DmarcConfig = struct {
     apply_pct: bool,
     public_suffix_list: ?[]const u8,
     limits: connection_mod.Limits,
-    /// Wall-clock bound on one message's evaluation, in ms; 0 disables (X-21).
-    /// The DMARC policy walk and each DKIM identifier's org-domain walk are
-    /// the DNS steps it bounds.
+    /// Message-evaluation deadline in milliseconds; zero disables it.
     max_evaluation_ms: i64,
 };
 /// Parse the SecureDMARC config from a loaded Config.
@@ -83,12 +69,7 @@ pub fn parseDmarcConfig(allocator: Allocator, cfg: *const config_mod.Config) !Dm
         }
     }
 
-    // Loopback, NOT 0.0.0.0. The milter protocol has no authentication, so anything
-    // reaching this socket is trusted absolutely -- and this daemon is the one that
-    // decides disposition. A reachable port lets an attacker feed a message whose
-    // Authentication-Results it will believe, which is finding M-1/X-1 delivered
-    // without needing to forge a header at all, and under p=reject it decides what
-    // gets bounced. Postfix is the only intended client and it is local.
+    // Default to loopback because the milter protocol does not authenticate clients.
     if (addrs.items.len == 0) {
         try addrs.append(allocator, .{ .tcp = .{ .host = "127.0.0.1", .port = 8894 } });
     }

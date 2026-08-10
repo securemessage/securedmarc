@@ -2,30 +2,11 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
-/// Public Suffix List, used only as a veto over the DNS tree walk.
+/// Optional Public Suffix List veto for RFC 9989 DNS tree walks.
 ///
-/// DEPRECATED. This module covers the transition to RFC 9989 and is expected
-/// to be removed. The RFC replaced the PSL with the tree walk outright and
-/// observes that a PSL "might arrive at a different answer" than the walk, so
-/// consulting one at all is a deliberate deviation, kept narrow on purpose:
-/// it may only reject a boundary the walk selected, never select one. Once
-/// psd= is widely published there is nothing left for it to reject and this
-/// file and the PublicSuffixList option should both go.
-///
-/// RFC 9989 replaced the PSL with the tree walk, and the tree walk is what
-/// decides the Organizational Domain here. The list covers one residual gap:
-/// tree-walk rule 3 picks the shortest name that published a DMARC record, on
-/// the assumption that a registry publishing DMARC also publishes psd=y. A
-/// registry that omits the tag would be selected as an Organizational Domain
-/// shared by all its registrants — exactly the boundary collapse that makes
-/// `attacker.co.uk` align with `victim.co.uk`.
-///
-/// The list is therefore advisory and optional: absent, the daemon runs on the
-/// tree walk alone; present, it may only reject a boundary, never choose one.
-///
-/// Format is the publicsuffix.org file (as shipped by the FreeBSD
-/// dns/public_suffix_list port): one rule per line, `//` comments, blank lines
-/// ignored, `*` wildcard labels and `!` exceptions.
+/// The tree walk selects the organizational domain; a configured list may only
+/// reject a selected public suffix. It accepts publicsuffix.org rules, comments,
+/// wildcards, and exceptions.
 pub const PublicSuffixList = struct {
     allocator: Allocator,
     /// Literal rules, e.g. "co.uk".
