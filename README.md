@@ -98,6 +98,17 @@ milter_default_action = accept
 
 Order: **SPF (8890) → DKIM (8891) → DMARC (8894) → ARC (8895)**
 
+## CLI Tools
+
+### securedmarc-check
+
+Evaluate DMARC for a set of already-authenticated SPF/DKIM identifiers, calling the same policy, tree-walk, alignment, and disposition code path the daemon uses. Takes identifiers directly on the command line rather than a message file:
+
+```sh
+securedmarc-check --from example.com --mailfrom example.com --spf pass \
+    --dkim example.com --dkim-result pass
+```
+
 ## Signals
 
 - **SIGHUP** — Reload configuration
