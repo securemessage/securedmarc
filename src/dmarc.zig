@@ -199,9 +199,8 @@ pub fn hasValidReportingUri(rua: []const u8) bool {
 ///
 /// This distinction matters to the tree walk: null means "nothing here, keep
 /// walking", whereas a record with an unusable policy may end DMARC processing
-/// for the message outright. Returning null for a missing `p=` conflated the
-/// two and silently applied a *parent's* policy to a domain the RFC says to
-/// treat as `p=none`.
+/// for the message outright. Conflating the two would apply a *parent's*
+/// policy to a domain the RFC says to treat as `p=none`.
 pub fn parseRecord(txt: []const u8) ?DmarcRecord {
     const trimmed = mem.trim(u8, txt, &std.ascii.whitespace);
     if (trimmed.len < 8) return null;
@@ -212,8 +211,7 @@ pub fn parseRecord(txt: []const u8) ?DmarcRecord {
     // record whose v= is absent, not first, or not exactly "DMARC1" MUST be
     // ignored entirely.
     //
-    // So "V=DMARC1" is a valid record and "v=dmarc1" is not one at all. Both
-    // used to parse, which meant a malformed record was read as policy.
+    // So "V=DMARC1" is a valid record and "v=dmarc1" is not one at all.
     if (trimmed.len < 2) return null;
     if (std.ascii.toLower(trimmed[0]) != 'v') return null;
     if (trimmed[1] != '=') return null;
@@ -318,8 +316,8 @@ pub fn evaluate(
 ///
 /// RFC 7489 §7.2's `<policy_evaluated>` carries the SPF and DKIM alignment
 /// outcomes as separate elements from the disposition, so an aggregate report
-/// cannot be produced from the verdict alone. Both were already computed here
-/// and discarded, which left the reporting event unable to state them (audit
+/// cannot be produced from the verdict alone; both facts must be retained
+/// alongside it, not discarded once the pass/fail result is known (audit
 /// M-7a).
 pub const Evaluation = struct {
     result: Result,
@@ -356,11 +354,9 @@ pub fn evaluateDetailed(
 /// The first verified DKIM identifier that aligns with the Author Domain.
 ///
 /// A message may carry several DKIM signatures, and DMARC succeeds if *any*
-/// verified one is aligned (RFC 9989 §4.10.3). Evaluating a single identifier
-/// meant an aligned signature sitting behind a failing one was invisible, and —
-/// because the result and the `d=` domain used to be collected by two
-/// independent scans — the pair being judged was not necessarily a pair that
-/// appeared in the header at all (audit M-6).
+/// verified one is aligned (RFC 9989 §4.10.3); evaluating only the first
+/// would leave an aligned signature sitting behind a failing one invisible
+/// (audit M-6).
 ///
 /// Returned rather than reduced to a bool so the caller can report the pair the
 /// verdict actually rests on, instead of re-deriving it and possibly naming a
@@ -655,8 +651,7 @@ test "tag names are case insensitive but the v= value is not" {
     try std.testing.expectEqual(Policy.reject, r.policy);
     try std.testing.expectEqual(alignment.AlignmentMode.strict, r.adkim);
 
-    // These used to parse as valid records, which meant a record the RFC says
-    // to ignore entirely was read as policy.
+    // §4.7: a `v=` value that is not exactly "DMARC1" MUST be ignored entirely.
     try std.testing.expect(parseRecord("v=dmarc1; p=reject") == null);
     try std.testing.expect(parseRecord("v=DMARc1; p=reject") == null);
     try std.testing.expect(parseRecord("v=Dmarc1; p=reject") == null);
@@ -671,11 +666,10 @@ test "reject things that are not DMARC records at all" {
 }
 
 test "a record with no p= is still a record, per 4.10.1" {
-    // This previously asserted `== null`, encoding the pre-RFC-9989 reading
-    // that a missing p= means "no record here". §4.10.1 gives such a record
-    // defined behaviour, and treating it as absent let the tree walk apply a
-    // *parent's* policy -- potentially p=reject -- to a domain the RFC says to
-    // treat as p=none or to exempt from DMARC entirely.
+    // §4.10.1 gives such a record defined behaviour; treating it as absent
+    // would let the tree walk apply a *parent's* policy -- potentially
+    // p=reject -- to a domain the RFC says to treat as p=none or to exempt
+    // from DMARC entirely.
     const bare = parseRecord("v=DMARC1") orelse return error.ParseFailed;
     try std.testing.expect(!bare.policy_valid);
     try std.testing.expectEqual(Applicability.no_processing, bare.applicability());

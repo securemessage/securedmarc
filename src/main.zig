@@ -244,15 +244,11 @@ fn runDaemon() !void {
 // =============================================================================
 
 // This daemon acts only at end-of-message, so `on_eom` is the only phase
-// registered below. An unregistered callback yields `Code.continue`, which is
-// exactly what the six stubs that used to sit here returned.
-//
-// Two of them carried reasoning worth keeping, since neither is recoverable from
-// the remaining code:
+// registered below. An unregistered callback yields `Code.continue`.
 //
 //   - Headers need no callback. The worker calls `Connection.addHeader` itself
 //     before dispatching, so accumulation does not depend on this daemon
-//     registering anything; a stub here only looked as though it did.
+//     registering anything.
 //
 //   - `skip_flags` deliberately does NOT set `no_body`, even though DMARC never
 //     reads the body. Declining the body is a negotiation this daemon could win

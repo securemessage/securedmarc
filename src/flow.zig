@@ -168,9 +168,8 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     //
     // The second branch is why this is a decision and not a default: reporting
     // `none` here is the RFC's answer, whereas falling through to a parent's
-    // record -- what returning null from parseRecord used to cause -- could
-    // apply an organizational `p=reject` to a domain the RFC says to leave
-    // alone, and reject mail on the strength of a malformed record.
+    // record could apply an organizational `p=reject` to a domain the RFC says
+    // to leave alone, and reject mail on the strength of a malformed record.
     var rec = selected;
     switch (rec.applicability()) {
         .apply => {},
@@ -333,11 +332,11 @@ fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
 /// One DMARC evaluation, as the future `securedmarc-reporter` needs to see it.
 ///
 /// The field set is the one the suite plan specifies, which in turn is what
-/// RFC 7489 §7.2 requires of an aggregate report row. Five of these used to be
-/// absent (audit M-7a). `client_ip` was the one that mattered: it is mandatory on
-/// every `<record><row>` and it is the only field here that a subscriber cannot
-/// reconstruct after the fact, because the connecting address is known to the
-/// milter and to nothing downstream of it.
+/// RFC 7489 §7.2 requires of an aggregate report row (audit M-7a). `client_ip`
+/// is the field that matters most: it is mandatory on every `<record><row>`
+/// and it is the only field here that a subscriber cannot reconstruct after
+/// the fact, because the connecting address is known to the milter and to
+/// nothing downstream of it.
 const Event = struct {
     client_ip: []const u8,
 
@@ -345,10 +344,10 @@ const Event = struct {
     /// `<header_from>` holds: RFC 9990 SS3.1.1.10 and RFC 7489 Appendix C both
     /// define the element as "the RFC5322.From domain from the message".
     ///
-    /// It held the full mailbox until 2026-08-02, which made the one field a
-    /// reporter can copy straight into the XML the one field it must not. The
-    /// name is the report's, so it carries the report's meaning; the mailbox is
-    /// next door under a name the RFC does not use for anything.
+    /// Holding the full mailbox here would make the one field a reporter can
+    /// copy straight into the XML the one field it must not. The name is the
+    /// report's, so it carries the report's meaning; the mailbox is next door
+    /// under a name the RFC does not use for anything.
     header_from: []const u8,
 
     /// The whole RFC5322.From mailbox, local-part included.
@@ -390,10 +389,10 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
     // `header_from`, `from_address`, `dkim_domain` and `envelope_from` all
     // originate in the message or its envelope, so each is sender-chosen; the
     // results, the policy and the disposition are ours, and `client_ip` comes
-    // from the MTA rather than the message. A `"` in any sender-chosen value used
-    // to end its JSON string early and leave the rest of the payload to be
-    // reinterpreted by the consumer (audit X-5), so every value that did not
-    // originate here is escaped — `client_ip` included, since a value being
+    // from the MTA rather than the message. An unescaped `"` in a sender-chosen
+    // value would end its JSON string early and leave the rest of the payload
+    // to be reinterpreted by the consumer (audit X-5), so every value that did
+    // not originate here is escaped — `client_ip` included, since a value being
     // trustworthy today is not a reason for the payload to depend on it.
     return std.fmt.allocPrint(allocator,
         \\{{"client_ip":"{f}","header_from":"{f}","from_address":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
@@ -415,13 +414,13 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
 
 /// Record the DMARC result on the message.
 ///
-/// Both stamping functions here returned `void` and swallowed every failure, so
-/// a message could be delivered carrying no `dmarc=` field while the daemon
-/// reported success (audit X-9). This daemon is the end of the chain: its field
-/// is what a downstream mailbox provider or a local delivery rule reads to decide
-/// disposition. Losing it silently means the message is treated as if DMARC was
-/// never evaluated, which for a `p=reject` domain is the difference between a
-/// rejection and a delivery.
+/// Both stamping functions here must stay fallible (audit X-9): swallowing a
+/// failure would deliver a message carrying no `dmarc=` field while the
+/// daemon reported success. This daemon is the end of the chain: its field is
+/// what a downstream mailbox provider or a local delivery rule reads to decide
+/// disposition. Losing it silently means the message is treated as if DMARC
+/// was never evaluated, which for a `p=reject` domain is the difference
+/// between a rejection and a delivery.
 fn addArHeaderSimple(conn: *connection_mod.Connection, ctx: MsgCtx, result_str: []const u8, reason: []const u8) !void {
     try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
         .{
@@ -483,9 +482,9 @@ test "M-7a: the event carries every field an aggregate report row needs" {
         // A *domain*, and the fixture says so. RFC 9990 SS3.1.1.10 defines the
         // report element of this name as "the RFC5322.From domain from the
         // message", so a reporter copies this field straight into
-        // `<identifiers><header_from>`. It carried `sender@example.com` until
-        // 2026-08-02, which would have put a local-part into every report row
-        // -- data DMARC does not authenticate and the schema does not describe.
+        // `<identifiers><header_from>`. Carrying the full mailbox here instead
+        // would put a local-part into every report row -- data DMARC does not
+        // authenticate and the schema does not describe.
         "\"header_from\":\"example.com\"",
         "\"from_address\":\"sender@example.com\"",
         "\"envelope_from\":\"bounce.example.com\"",
@@ -568,12 +567,11 @@ test "M-7a: a quote in a sender-chosen field cannot break the payload" {
 }
 // X-9: both wrappers must stay fallible.
 //
-// Both returned `void` and swallowed every failure, so a message could be
-// delivered with no `dmarc=` field while this daemon reported success. This
-// daemon is the end of the chain, so that field is the only record of the
-// verdict: losing it silently means the message is treated as though DMARC was
-// never evaluated, which for a `p=reject` domain is the difference between a
-// rejection and a delivery.
+// Swallowing a failure would deliver a message with no `dmarc=` field while
+// this daemon reported success. This daemon is the end of the chain, so that
+// field is the only record of the verdict: losing it silently means the
+// message is treated as though DMARC was never evaluated, which for a
+// `p=reject` domain is the difference between a rejection and a delivery.
 test "the DMARC stamping wrappers cannot swallow failures" {
     comptime {
         for (.{ addArHeaderSimple, addArHeaderFull }) |f| {
