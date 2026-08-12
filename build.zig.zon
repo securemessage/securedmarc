@@ -1,6 +1,6 @@
 .{
     .name = .securedmarc,
-    .version = "0.6.2",
+    .version = "0.6.3",
     .fingerprint = 0xbc404386668d8646,
     .minimum_zig_version = "0.15.0",
     .paths = .{
