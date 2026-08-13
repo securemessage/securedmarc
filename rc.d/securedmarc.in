@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# PROVIDE: securedmarc
+# REQUIRE: LOGIN dns
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="securedmarc"
+rcvar="${name}_enable"
+desc="SecureDMARC milter daemon (RFC 7489 DMARC policy evaluation)"
+
+load_rc_config $name
+
+: ${securedmarc_enable:="NO"}
+: ${securedmarc_config:="%%PREFIX%%/etc/securedmarc/securedmarc.conf"}
+: ${securedmarc_pidfile:="/var/run/securedmarc/securedmarc.pid"}
+
+pidfile="${securedmarc_pidfile}"
+command="%%PREFIX%%/bin/securedmarc"
+command_args="-c ${securedmarc_config}"
+
+run_rc_command "$1"
