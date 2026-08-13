@@ -141,9 +141,46 @@ ZmqTopic        = dmarc.evaluation
 # setting.
 # ApplyPct      = no
 
+# --- Disposition enforcement (all optional; default stamps only) ---
+#
+# The daemon always records the verdict in Authentication-Results. The keys
+# below decide whether it also ACTS on a dmarc=fail. The decision uses the
+# effective policy — t=y steps down one level, sp=/np= select per subdomain,
+# pct= only if ApplyPct is on — and never fires on temperror: RFC 9989
+# section 5.3.6 forbids applying a published policy to a message that could
+# not be evaluated.
+#
+# RejectText is the SMTP reply used when a listener rejects; %s is replaced
+# by the Author Domain and must appear (OpenDMARC's RejectString rule).
+# RejectText      = rejected by DMARC policy for %s
+#
+# QuarantineHeader is the header added when a listener tags a message for
+# the LDA to file away (a dovecot Sieve rule matches on it). Any pre-existing
+# instance of this header on the message is removed first: the tag means
+# nothing unless this daemon added it.
+# QuarantineHeader = X-SecureDMARC-Disposition
+#
+# TrustedSealersFile lists authserv-ids, one per line, whose sealed ARC
+# chains may downgrade a reject to a quarantine tag. The override fires only
+# when our own SecureARC validated the chain (arc=pass) AND the sealer's own
+# ARC-Authentication-Results records pass evidence for the From domain — a
+# chain that honestly sealed a failure overrides nothing. Read once at
+# startup; restart to refresh. This is the escape hatch for mailing lists
+# and forwarding, which break alignment on legitimate mail.
+# TrustedSealersFile = /usr/local/etc/securedmarc/trusted-sealers
+
 [listener:inbound]
 # The address must be numeric: no DNS is performed, so inet:PORT@localhost is a
 # configuration ERROR, not a synonym for 127.0.0.1. A Socket value that cannot be
 # parsed stops startup and names this section; it is never silently ignored and
 # never falls back to the default listener.
 Socket          = inet:8894@127.0.0.1
+
+# What this listener does with a dmarc=fail under an enforcing policy:
+#   none       stamp only (default)
+#   quarantine add QuarantineHeader for the LDA
+#   reject     550 5.7.1 at SMTP time; quarantine policy still tags
+# Enforcement is per-listener because it is a property of where the mail came
+# from: an internet-facing listener enforces, a submission-facing one must
+# never. An unrecognised value stops startup rather than guessing a policy.
+# Enforcement     = none

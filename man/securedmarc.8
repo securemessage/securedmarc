@@ -260,6 +260,37 @@ but not yet moved to
 .Cm t=
 still need a partial rollout honoured; it is a transition aid, not a
 recommended long-term setting.
+.It Cm RejectText
+SMTP reply text used when a listener with
+.Cm Enforcement Ns = Ns Ar reject
+refuses a message.
+The string must contain
+.Ql %s
+exactly once; it is replaced by the Author Domain (the OpenDMARC
+.Cm RejectString
+rule).
+Default:
+.Dq rejected by DMARC policy for %s .
+.It Cm QuarantineHeader
+Header field added when a listener with quarantine enforcement tags a
+message for the LDA to file away.
+Any pre-existing instance of this header on the message is removed first:
+the tag means nothing unless this daemon added it.
+Default:
+.Dq X-SecureDMARC-Disposition .
+.It Cm TrustedSealersFile
+Path to a file of authserv-ids, one per line, whose sealed ARC chains may
+downgrade a reject to a quarantine tag.
+The override fires only when this ADMD's own
+.Xr securearc 8
+validated the chain
+.Pq Cm arc=pass
+AND the sealer's own ARC-Authentication-Results records pass evidence for the
+From domain; a chain that honestly sealed a failure overrides nothing.
+This is the escape hatch for mailing lists and forwarding, which break
+alignment on legitimate mail.
+The file is read once at startup; restart to refresh.
+Default: none.
 .It Cm ZmqEndpoint
 ZeroMQ PUB endpoint for event publishing.
 Disabled if not set.
@@ -285,6 +316,38 @@ must be a numeric IPv4 or IPv6 address; no name resolution is performed.
 A value that cannot be parsed is a fatal configuration error and is reported
 with the section that contains it \(em it is never ignored, and never falls
 back to the default listener.
+.It Cm Enforcement
+What this listener does with a
+.Ql dmarc=fail
+verdict under an enforcing published policy:
+.Ar none
+(stamp only, the default),
+.Ar quarantine
+(add
+.Cm QuarantineHeader
+for the LDA), or
+.Ar reject
+(550 5.7.1 at SMTP time with
+.Cm RejectText ;
+a quarantine policy still tags).
+.Pp
+The decision uses the effective policy
+.Po Cm t=
+steps down one level,
+.Cm sp= Ns / Ns Cm np=
+select per subdomain,
+.Cm pct=
+only if
+.Cm ApplyPct
+is on
+.Pc
+and never fires on temperror: RFC 9989 section 5.3.6 forbids applying a
+published policy to a message that could not be evaluated.
+.Pp
+Enforcement is per-listener because it is a property of where the mail came
+from: an internet-facing listener enforces, a submission-facing one must
+never.
+An unrecognised value stops startup rather than guessing a policy.
 .El
 .Pp
 If no listener sections are defined, the default is

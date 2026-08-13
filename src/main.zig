@@ -40,6 +40,14 @@ var g_strip_policy: header_scrub.StripPolicy = .{ .own_methods = &.{"dmarc"} };
 var g_sampling: dmarc.SamplingPolicy = .ignore;
 var g_health_monitor: ?*dns_mod.HealthMonitor = null;
 
+/// Disposition enforcement (design-dmarc-enforcement.md). Set once at startup,
+/// read-only afterwards; the sealers file is load-once like the PSL (restart
+/// to refresh) until the RCU config container exists (audit X-2).
+var g_enforcement: []const settings.Enforcement = &.{};
+var g_reject_text: []const u8 = "rejected by DMARC policy for %s";
+var g_quarantine_header: []const u8 = "X-SecureDMARC-Disposition";
+var g_trusted_sealers: []const []const u8 = &.{};
+
 /// Wall-clock bound on one message's evaluation (X-21). Set once at startup;
 /// 0 disables.
 var g_max_evaluation_ms: i64 = deadline_mod.DEFAULT_MS;
@@ -105,6 +113,10 @@ fn msgCtx() flow.MsgCtx {
         .resolver = getResolver,
         .publisher = getPublisher,
         .max_evaluation_ms = g_max_evaluation_ms,
+        .enforcement = g_enforcement,
+        .reject_text = g_reject_text,
+        .quarantine_header = g_quarantine_header,
+        .trusted_sealers = g_trusted_sealers,
     };
 }
 
@@ -117,6 +129,24 @@ fn onEom(conn: *connection_mod.Connection) u8 {
 fn usageError() error{InvalidArgument} {
     log.err("usage: securedmarc -c <config-file>", .{});
     return error.InvalidArgument;
+}
+
+/// One authserv-id per line, `#` comments and blank lines skipped — the same
+/// file shape as securespf's WhitelistFile.
+fn loadIdList(allocator: Allocator, path: []const u8) ![]const []const u8 {
+    const text = try std.fs.cwd().readFileAlloc(allocator, path, 1 << 20);
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+    var lines = mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Every failure below is reported by `bootstrap.fatal`, which explains why: after
@@ -169,6 +199,21 @@ fn runDaemon() !void {
     g_zmq_endpoint = dmarc_cfg.zmq_endpoint;
     g_zmq_topic = dmarc_cfg.zmq_topic;
     g_strip_policy = .{ .own_methods = &.{"dmarc"}, .strip_all = dmarc_cfg.strip_auth_results };
+
+    g_enforcement = dmarc_cfg.enforcement;
+    g_reject_text = dmarc_cfg.reject_text;
+    g_quarantine_header = dmarc_cfg.quarantine_header;
+
+    if (dmarc_cfg.trusted_sealers_file) |path| {
+        if (loadIdList(allocator, path)) |list| {
+            g_trusted_sealers = list;
+            log.info("loaded {d} trusted ARC sealer(s) from {s}", .{ list.len, path });
+        } else |err| {
+            // Fail closed on trust: no list, no overrides. Enforcement itself
+            // is unaffected.
+            log.err("failed to load TrustedSealersFile {s}: {}; no ARC overrides will fire", .{ path, err });
+        }
+    }
 
     // The tree walk decides the organizational boundary; the list, if present,
     // may only reject a boundary that is demonstrably a public suffix.

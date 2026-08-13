@@ -20,6 +20,9 @@ const alignment = @import("alignment.zig");
 const treewalk = @import("treewalk.zig");
 const psl = @import("psl.zig");
 const upstream = @import("upstream.zig");
+const settings = @import("settings.zig");
+
+const codec = securemilter.milter.codec;
 
 /// Per-message configuration used by the flow.
 pub const MsgCtx = struct {
@@ -39,7 +42,50 @@ pub const MsgCtx = struct {
     /// constant is the L-2 mechanism. The DMARC walk and each DKIM
     /// identifier's org-domain walk are the DNS steps it bounds.
     max_evaluation_ms: i64,
+
+    /// Per-listener disposition enforcement (design-dmarc-enforcement.md),
+    /// indexed by `conn.listener_index`. Empty slice means never enforce.
+    enforcement: []const settings.Enforcement,
+    /// SMTP reply text template for reject enforcement (%s = Author Domain).
+    reject_text: []const u8,
+    /// Header name used when quarantine enforcement tags for the LDA.
+    quarantine_header: []const u8,
+    /// authserv-ids whose sealed ARC chains downgrade reject to quarantine.
+    trusted_sealers: []const []const u8,
 };
+
+/// What the gate does with a judged failure.
+pub const GateAction = enum { none, tag, reject };
+
+/// The enforcement gate, pure: verdict x effective policy x listener setting
+/// x trusted-sealer override.
+///
+/// Only a judged `fail` acts: RFC 9989 §5.3.6 forbids applying the published
+/// policy to a message that could not be evaluated, and every non-fail path
+/// (temperror/permerror/none) is exactly that. The override downgrades one
+/// level -- reject to tag -- never to silent acceptance: a chain we trust
+/// says the mail authenticated at a hop we trust, not that we must deliver it
+/// to the inbox.
+pub fn decideGate(
+    result: dmarc.Result,
+    policy: dmarc.Policy,
+    enforcement: settings.Enforcement,
+    override: bool,
+) GateAction {
+    if (result != .fail) return .none;
+    return switch (policy) {
+        .none => .none,
+        .quarantine => switch (enforcement) {
+            .none => .none,
+            .quarantine, .reject => .tag,
+        },
+        .reject => switch (enforcement) {
+            .none => .none,
+            .quarantine => .tag,
+            .reject => if (override) .tag else .reject,
+        },
+    };
+}
 
 /// Maximum DKIM results evaluated from Authentication-Results.
 const MAX_DKIM_IDENTIFIERS = 10;
@@ -238,14 +284,44 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
     // Step 6: Add Authentication-Results header
     // Sampling keys off the Message-ID so a retried message keeps the verdict it
     // was given; see `dmarc.inSample`. Absent, the message counts as selected.
-    const disposition = dmarc.effectivePolicySampled(
+    const effective = dmarc.effectivePolicySampled(
         &rec,
         is_subdomain,
         ctx.sampling,
         getMessageId(conn),
-    ).toString();
+    );
+    const disposition = effective.toString();
     addArHeaderFull(conn, ctx, result.toString(), from_domain, disposition) catch |err|
         return auth_stamp.deferCode(err, "dmarc");
+
+    // A1: disposition enforcement. The stamp is already written before any
+    // action: on an SMTP-time reject it never propagates, on a tag it rides
+    // along for the LDA.
+    const enforcement: settings.Enforcement = if (conn.listener_index < ctx.enforcement.len)
+        ctx.enforcement[conn.listener_index]
+    else
+        .none;
+
+    // The override asks two independent questions: did OUR securearc call the
+    // chain valid (arc=pass), and does a trusted sealer's own AAR record pass
+    // evidence for this From domain. A valid chain that sealed a failure is
+    // custody of bad news, not a reason to soften.
+    var override_sealer: ?[]const u8 = null;
+    defer if (override_sealer) |s| conn.allocator.free(s);
+    if (result == .fail and enforcement == .reject and ctx.trusted_sealers.len > 0) {
+        if (up.arc_result) |arc_res| {
+            if (std.ascii.eqlIgnoreCase(arc_res, "pass")) {
+                override_sealer = upstream.trustedSealerEvidence(
+                    conn.allocator,
+                    conn.headers.items,
+                    ctx.trusted_sealers,
+                    from_domain,
+                );
+            }
+        }
+    }
+
+    const action = decideGate(result, effective, enforcement, override_sealer != null);
 
     // Publish ZMQ event with full evaluation details
     publishEvent(ctx, conn.allocator, .{
@@ -265,7 +341,25 @@ fn doDmarcEvaluation(conn: *connection_mod.Connection, ctx: MsgCtx) u8 {
         .dkim_result = reported_dkim.result orelse "none",
         .dkim_domain = reported_dkim.domain orelse "",
         .dkim_aligned = evaluation.dkim_aligned,
+        .policy_override = if (override_sealer) |_| "trusted_forwarder" else "",
     });
+
+    switch (action) {
+        .none => {},
+        .tag => {
+            tagForQuarantine(conn, ctx) catch |err| return auth_stamp.deferCode(err, "dmarc");
+            if (override_sealer) |s| {
+                log.info("dmarc: {s}: fail under p=reject downgraded to quarantine by trusted ARC sealer {s}", .{ from_domain, s });
+            } else {
+                log.info("dmarc: {s}: fail under p={s}, tagged {s} for the LDA", .{ from_domain, disposition, ctx.quarantine_header });
+            }
+        },
+        .reject => {
+            log.info("dmarc: {s}: fail under p=reject, rejecting at SMTP time", .{from_domain});
+            return rejectMessage(conn, ctx, from_domain) catch |err|
+                auth_stamp.deferCode(err, "dmarc");
+        },
+    }
 
     return @intFromEnum(responses.Code.@"continue");
 }
@@ -323,6 +417,68 @@ fn getFromDomain(conn: *connection_mod.Connection) ?[]const u8 {
     return alignment.getDomainFromEmail(getFromAddress(conn) orelse return null);
 }
 
+/// Tag a message for the LDA (quarantine enforcement). Any pre-existing
+/// instance of the configured header is a forgery -- the tag means nothing
+/// unless we added it -- so those go first, newest occurrence of the name
+/// first, because SMFIR_CHGHEADER addresses the n-th instance of a name and
+/// removing a lower index would renumber the ones above it (header_scrub's
+/// rule, by name rather than by authserv-id).
+fn tagForQuarantine(conn: *connection_mod.Connection, ctx: MsgCtx) !void {
+    // Forward pass, mirroring header_scrub: record each forged instance's
+    // list position and its 1-based occurrence among same-name headers.
+    const Victim = struct { list_pos: usize, occurrence: u32 };
+    var victims: std.ArrayListUnmanaged(Victim) = .{};
+    defer victims.deinit(conn.allocator);
+    var occurrence: u32 = 0;
+    for (conn.headers.items, 0..) |hdr, pos| {
+        if (!std.ascii.eqlIgnoreCase(hdr.name, ctx.quarantine_header)) continue;
+        occurrence += 1;
+        try victims.append(conn.allocator, .{ .list_pos = pos, .occurrence = occurrence });
+    }
+
+    if (victims.items.len > 0) {
+        if (!conn.negotiated_actions.change_headers) {
+            // Forged tag present and we cannot remove it: refuse to tag at all
+            // rather than leave the sender's instance beside ours.
+            log.err("cannot tag for quarantine: forged {s} present and MTA did not grant SMFIF_CHGHDRS", .{ctx.quarantine_header});
+            return error.CannotTag;
+        }
+        // Delete newest occurrence first: removing a lower index would
+        // renumber the ones above it (header_scrub's rule).
+        var i: usize = victims.items.len;
+        while (i > 0) {
+            i -= 1;
+            const v = victims.items[i];
+            const payload = try responses.changeHeader(conn.allocator, v.occurrence, ctx.quarantine_header, "");
+            defer conn.allocator.free(payload);
+            try codec.writePacket(conn.fd, payload);
+            conn.removeHeader(v.list_pos);
+        }
+    }
+
+    const payload = try responses.insertHeader(
+        conn.allocator,
+        0,
+        ctx.quarantine_header,
+        "quarantine",
+        conn.negotiated_protocol.header_leading_space,
+    );
+    defer conn.allocator.free(payload);
+    try codec.writePacket(conn.fd, payload);
+}
+
+/// Reject at SMTP time. RFC 9989 §7.2 prefers this over a later DSN, which
+/// would be backscatter to a forged envelope sender.
+fn rejectMessage(conn: *connection_mod.Connection, ctx: MsgCtx, from_domain: []const u8) !u8 {
+    // settings refused a template without %s at startup.
+    const text = try mem.replaceOwned(u8, conn.allocator, ctx.reject_text, "%s", from_domain);
+    defer conn.allocator.free(text);
+    const payload = try responses.replyCode(conn.allocator, "550 5.7.1", text);
+    defer conn.allocator.free(payload);
+    try codec.writePacket(conn.fd, payload);
+    return @intFromEnum(responses.Code.reject);
+}
+
 fn getEnvelopeDomain(conn: *connection_mod.Connection) ?[]const u8 {
     const raw = conn.mail_from_raw orelse return null;
     const addr = alignment.stripAngleBrackets(raw);
@@ -371,6 +527,10 @@ const Event = struct {
     dkim_result: []const u8,
     dkim_domain: []const u8,
     dkim_aligned: bool,
+    /// RFC 7489 §7.2 policy_override, present only when one fired. Emitted
+    /// rather than left implicit: without it a report consumer cannot tell an
+    /// overridden reject apart from a verdict we never enforced.
+    policy_override: []const u8 = "",
 };
 
 fn publishEvent(ctx: MsgCtx, allocator: Allocator, ev: Event) void {
@@ -394,7 +554,7 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
     // to be reinterpreted by the consumer (audit X-5), so every value that did
     // not originate here is escaped — `client_ip` included, since a value being
     // trustworthy today is not a reason for the payload to depend on it.
-    return std.fmt.allocPrint(allocator,
+    const base = try std.fmt.allocPrint(allocator,
         \\{{"client_ip":"{f}","header_from":"{f}","from_address":"{f}","envelope_from":"{f}","policy":"{s}","disposition":"{s}","dmarc_result":"{s}","spf_result":"{s}","spf_aligned":{s},"dkim_result":"{s}","dkim_domain":"{f}","dkim_aligned":{s}}}
     , .{
         escape.jsonString(ev.client_ip),
@@ -409,6 +569,13 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
         ev.dkim_result,
         escape.jsonString(ev.dkim_domain),
         if (ev.dkim_aligned) "true" else "false",
+    });
+    if (ev.policy_override.len == 0) return base;
+    defer allocator.free(base);
+    // Ours and a constant, so no escaping question arises.
+    return std.fmt.allocPrint(allocator, "{s},\"policy_override\":\"{s}\"}}", .{
+        base[0 .. base.len - 1],
+        ev.policy_override,
     });
 }
 
@@ -499,6 +666,77 @@ test "M-7a: the event carries every field an aggregate report row needs" {
             return error.TestFailed;
         }
     }
+}
+
+test "gate: only a judged fail under an enforcing listener acts" {
+    const P = dmarc.Policy;
+    const R = dmarc.Result;
+    const E = settings.Enforcement;
+
+    // Verdict gate: pass/none/temperror/permerror never act (RFC 9989 §5.3.6).
+    for ([_]R{ .pass, .none, .temperror, .permerror }) |r| {
+        try std.testing.expectEqual(GateAction.none, decideGate(r, .reject, .reject, false));
+    }
+    // p=none never acts, whatever the listener wants.
+    try std.testing.expectEqual(GateAction.none, decideGate(R.fail, P.none, E.reject, false));
+    // An unenforcing listener stamps, never acts.
+    try std.testing.expectEqual(GateAction.none, decideGate(R.fail, P.reject, E.none, false));
+    // quarantine enforcement tags both quarantine and reject policies.
+    try std.testing.expectEqual(GateAction.tag, decideGate(R.fail, P.quarantine, E.quarantine, false));
+    try std.testing.expectEqual(GateAction.tag, decideGate(R.fail, P.reject, E.quarantine, false));
+    // reject enforcement: quarantine policy tags, reject policy rejects.
+    try std.testing.expectEqual(GateAction.tag, decideGate(R.fail, P.quarantine, E.reject, false));
+    try std.testing.expectEqual(GateAction.reject, decideGate(R.fail, P.reject, E.reject, false));
+    // The trusted-sealer override downgrades exactly one level.
+    try std.testing.expectEqual(GateAction.tag, decideGate(R.fail, P.reject, E.reject, true));
+    // and changes nothing where reject was not the action.
+    try std.testing.expectEqual(GateAction.none, decideGate(R.fail, P.none, E.reject, true));
+    try std.testing.expectEqual(GateAction.tag, decideGate(R.fail, P.quarantine, E.reject, true));
+}
+
+test "event records a policy_override only when one fired" {
+    const json_plain = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "bounce.example.com",
+        .policy = "reject",
+        .disposition = "reject",
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+    });
+    defer std.testing.allocator.free(json_plain);
+    try std.testing.expect(mem.indexOf(u8, json_plain, "policy_override") == null);
+
+    const json_overridden = try formatEvent(std.testing.allocator, .{
+        .client_ip = "203.0.113.42",
+        .header_from = "example.com",
+        .from_address = "sender@example.com",
+        .envelope_from = "bounce.example.com",
+        .policy = "reject",
+        .disposition = "reject",
+        .dmarc_result = "fail",
+        .spf_result = "fail",
+        .spf_aligned = false,
+        .dkim_result = "fail",
+        .dkim_domain = "",
+        .dkim_aligned = false,
+        .policy_override = "trusted_forwarder",
+    });
+    defer std.testing.allocator.free(json_overridden);
+    try std.testing.expect(mem.indexOf(u8, json_overridden, "\"policy_override\":\"trusted_forwarder\"") != null);
+
+    // The extended payload must still parse as JSON.
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_overridden, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "trusted_forwarder",
+        parsed.value.object.get("policy_override").?.string,
+    );
 }
 
 test "M-7a: the published policy and the applied disposition are reported separately" {
