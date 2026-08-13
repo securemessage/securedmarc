@@ -12,7 +12,8 @@
 .Sh DESCRIPTION
 .Nm
 is a high-performance Domain-based Message Authentication, Reporting, and
-Conformance (DMARC) milter implementing RFC 7489.
+Conformance (DMARC) milter implementing RFC 9989 (DMARCbis), which obsoletes
+RFC 7489.
 It reads upstream SPF and DKIM Authentication-Results headers, evaluates
 DMARC policy alignment, and adds its own Authentication-Results header
 with the DMARC verdict.
@@ -23,6 +24,16 @@ must be placed in the milter chain after both
 and
 .Xr securedkim 8
 so that their Authentication-Results headers are available for evaluation.
+If
+.Cm Enforcement
+is configured with
+.Cm TrustedSealersFile ,
+.Nm
+must also run after
+.Xr securearc 8 Ns 's
+verify step, so an
+.Ql arc=
+result is available before the enforcement decision is made.
 .Sh OPTIONS
 .Bl -tag -width indent
 .It Fl c Ar config-file
@@ -409,6 +420,10 @@ package, for use with
 .Sh STANDARDS
 .Rs
 .%T Domain-based Message Authentication, Reporting, and Conformance (DMARC)
+.%R RFC 9989
+.Re
+.Rs
+.%T Domain-based Message Authentication, Reporting, and Conformance (DMARC), obsoleted by RFC 9989
 .%R RFC 7489
 .Re
 .Sh AUTHORS
