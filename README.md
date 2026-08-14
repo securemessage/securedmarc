@@ -88,7 +88,7 @@ securedmarc -c /usr/local/etc/securedmarc/securedmarc.conf
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `Socket` | — | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
+| `Socket` | -- | `inet:port@ip` or `unix:/path`. The IP must be numeric (no DNS). An unparseable value is a fatal startup error, never ignored. |
 | `Enforcement` | `none` | `none` (stamp only), `quarantine` (add `QuarantineHeader`), or `reject` (550 5.7.1 at SMTP time). Enable only on an internet-facing listener, never on one that accepts authenticated submissions |
 
 ## DMARC Enforcement
@@ -172,16 +172,16 @@ securedmarc-check --from example.com --mailfrom example.com --spf pass \
 
 ## Signals
 
-- **SIGHUP** — Reload configuration
-- **SIGTERM** — Graceful shutdown (30s drain timeout)
+- **SIGHUP** -- Reload configuration
+- **SIGTERM** -- Graceful shutdown (30s drain timeout)
 
 ## Part of the SecureMilter Suite
 
-- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) — Shared infrastructure library
-- [SecureSPF](https://pacyworld.dev/securemessage/securespf) — SPF verification
-- [SecureDKIM](https://pacyworld.dev/securemessage/securedkim) — DKIM signing and verification
-- **SecureDMARC** — DMARC policy evaluation (this project)
-- [SecureARC](https://pacyworld.dev/securemessage/securearc) — ARC chain validation and sealing
+- [securemilter-lib](https://pacyworld.dev/securemessage/securemilter-lib) -- Shared infrastructure library
+- [SecureSPF](https://pacyworld.dev/securemessage/securespf) -- SPF verification
+- [SecureDKIM](https://pacyworld.dev/securemessage/securedkim) -- DKIM signing and verification
+- **SecureDMARC** -- DMARC policy evaluation (this project)
+- [SecureARC](https://pacyworld.dev/securemessage/securearc) -- ARC chain validation and sealing
 
 ## Requirements
 
