@@ -22,7 +22,6 @@ const psl = @import("psl.zig");
 const upstream = @import("upstream.zig");
 const settings = @import("settings.zig");
 
-const codec = securemilter.milter.codec;
 
 /// Per-message configuration used by the flow.
 pub const MsgCtx = struct {
@@ -451,7 +450,7 @@ fn tagForQuarantine(conn: *connection_mod.Connection, ctx: MsgCtx) !void {
             const v = victims.items[i];
             const payload = try responses.changeHeader(conn.allocator, v.occurrence, ctx.quarantine_header, "");
             defer conn.allocator.free(payload);
-            try codec.writePacket(conn.fd, payload);
+            try conn.sendPacket(payload);
             conn.removeHeader(v.list_pos);
         }
     }
@@ -464,7 +463,7 @@ fn tagForQuarantine(conn: *connection_mod.Connection, ctx: MsgCtx) !void {
         conn.negotiated_protocol.header_leading_space,
     );
     defer conn.allocator.free(payload);
-    try codec.writePacket(conn.fd, payload);
+    try conn.sendPacket(payload);
 }
 
 /// Reject at SMTP time. RFC 9989 §7.2 prefers this over a later DSN, which
@@ -475,7 +474,7 @@ fn rejectMessage(conn: *connection_mod.Connection, ctx: MsgCtx, from_domain: []c
     defer conn.allocator.free(text);
     const payload = try responses.replyCode(conn.allocator, "550 5.7.1", text);
     defer conn.allocator.free(payload);
-    try codec.writePacket(conn.fd, payload);
+    try conn.sendPacket(payload);
     return @intFromEnum(responses.Code.reject);
 }
 
@@ -589,14 +588,14 @@ fn formatEvent(allocator: Allocator, ev: Event) ![]u8 {
 /// was never evaluated, which for a `p=reject` domain is the difference
 /// between a rejection and a delivery.
 fn addArHeaderSimple(conn: *connection_mod.Connection, ctx: MsgCtx, result_str: []const u8, reason: []const u8) !void {
-    try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
+    try auth_stamp.stamp(conn, ctx.authserv_id, &.{
         .{
             .method = "dmarc",
             .result = result_str,
             .reason = reason,
             .properties = &.{},
         },
-    }, conn.negotiated_protocol.header_leading_space);
+    });
 }
 
 fn addArHeaderFull(
@@ -609,7 +608,7 @@ fn addArHeaderFull(
     const reason = try std.fmt.allocPrint(conn.allocator, "p={s}", .{disposition});
     defer conn.allocator.free(reason);
 
-    try auth_stamp.stamp(conn.allocator, conn.fd, ctx.authserv_id, &.{
+    try auth_stamp.stamp(conn, ctx.authserv_id, &.{
         .{
             .method = "dmarc",
             .result = result_str,
@@ -620,7 +619,7 @@ fn addArHeaderFull(
                 .value = from_domain,
             }},
         },
-    }, conn.negotiated_protocol.header_leading_space);
+    });
 }
 
 test "M-7a: the event carries every field an aggregate report row needs" {
