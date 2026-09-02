@@ -20,4 +20,6 @@ pidfile="${securedmarc_pidfile}"
 command="%%PREFIX%%/bin/securedmarc"
 command_args="-c ${securedmarc_config}"
 
+extra_commands="reload"
+
 run_rc_command "$1"
